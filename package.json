@@ -1,0 +1,52 @@
+{
+  "name": "deer-flow-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that drives a deployed DeerFlow instance over its HTTP API: deep research and full thread/run/artifact control.",
+  "keywords": [
+    "modelcontextprotocol",
+    "mcp",
+    "deerflow",
+    "deep-research",
+    "agent"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "deer-flow-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc && chmod 755 dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js --transport http"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "2.0.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "commander": "^13.1.0",
+    "undici": "^7.0.0",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0",
+    "@types/node": "^24.0.0",
+    "eslint": "^9.0.0",
+    "eslint-plugin-prettier": "^5.2.1",
+    "prettier": "^3.4.0",
+    "typescript": "^5.8.2",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=20.18.1"
+  }
+}

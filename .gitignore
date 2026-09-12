@@ -1,0 +1,59 @@
+# Based on https://raw.githubusercontent.com/github/gitignore/main/Node.gitignore
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist
+dist-test
+
+# Logs
+logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Caches
+.cache
+.eslintcache
+.prettiercache
+
+# Diagnostic reports (https://nodejs.org/api/report.html)
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Coverage (vitest / istanbul)
+coverage
+.nyc_output
+*.lcov
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Optional npm cache directory
+.npm
+
+# Output of 'npm pack'
+*.tgz
+
+# Environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+.DS_Store
+.idea
+.vscode
+.vscode-test
+.cursor
+.claude
+.opencode
+
+# Lock files — project uses pnpm
+package-lock.json
+
+# kilo
+.kilo/plans
