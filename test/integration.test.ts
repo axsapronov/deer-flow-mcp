@@ -333,9 +333,7 @@ describe.each([
       arguments: { thread_id: threadId!, run_id: runId!, wait_seconds: 5 },
     });
     expect(textOf(res)).toContain(`Run ${runId} — success`);
-    const sc = res.structuredContent as { status: string; terminal: boolean };
-    expect(sc.status).toBe("success");
-    expect(sc.terminal).toBe(true);
+    expect(res.structuredContent).toBeUndefined();
 
     // The stub answers "running" on the first poll and "success" after, so
     // the wait loop must have polled at least twice.
@@ -379,7 +377,7 @@ describe.each([
     });
     expect(res.isError).toBeFalsy();
     expect(textOf(res)).toContain("Wait: run reached terminal status (success)");
-    expect((res.structuredContent as { reason: string }).reason).toBe("terminal");
+    expect(res.structuredContent).toBeUndefined();
 
     // The server must have attempted to join the run's live event stream.
     const join = requests.find((r) => r.path === `/api/threads/${threadId}/runs/${runId}/join`);

@@ -2,7 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/server";
 import { DeerFlowClient, DeerFlowError, type ArtifactResult } from "./client.js";
 import { formatProgress, formatRunStatus, formatTokenUsage, type RunStatusView } from "./format.js";
-import { isTerminalRunStatus, type Report, type RunStatus } from "./types.js";
+import { type Report, type RunStatus } from "./types.js";
 
 /**
  * A tool result. When the tool advertises an `outputSchema`, `structuredContent`
@@ -74,90 +74,6 @@ const startedRunSchema = z.object({
   web_url: z.string(),
 });
 
-const runStatusResultSchema = z.object({
-  thread_id: z.string(),
-  run_id: z.string(),
-  status: runStatusSchema,
-  stop_reason: z.string().nullable(),
-  terminal: z.boolean(),
-  elapsed_seconds: z.number().optional(),
-  updated_at: z.string().optional(),
-  seconds_since_update: z.number().optional(),
-  llm_call_count: z.number().optional(),
-  message_count: z.number().optional(),
-  total_tokens: z.number().optional(),
-  total_input_tokens: z.number().optional(),
-  total_output_tokens: z.number().optional(),
-  lead_agent_tokens: z.number().optional(),
-  subagent_tokens: z.number().optional(),
-  middleware_tokens: z.number().optional(),
-  error: z.string().optional(),
-});
-
-const todoItemSchema = z.object({
-  content: z.string(),
-  status: z.string(),
-});
-
-const runEventSummarySchema = z.object({
-  seq: z.number(),
-  at: z.string().optional(),
-  kind: z.enum(["ai", "tool", "error", "warning", "other"]),
-  summary: z.string(),
-});
-
-/** Shared shape of {@link RunProgress} (used by both the progress and wait tools). */
-const runProgressShape = {
-  run_id: z.string(),
-  thread_id: z.string(),
-  status: runStatusSchema,
-  stop_reason: z.string().nullable().optional(),
-  terminal: z.boolean(),
-  created_at: z.string().optional(),
-  updated_at: z.string().optional(),
-  elapsed_seconds: z.number(),
-  seconds_since_update: z.number().optional(),
-  total_tokens: z.number().optional(),
-  total_input_tokens: z.number().optional(),
-  total_output_tokens: z.number().optional(),
-  lead_agent_tokens: z.number().optional(),
-  subagent_tokens: z.number().optional(),
-  middleware_tokens: z.number().optional(),
-  llm_call_count: z.number().optional(),
-  message_count: z.number().optional(),
-  last_event_seq: z.number().optional(),
-  last_activity_at: z.string().optional(),
-  seconds_since_activity: z.number().optional(),
-  quiet: z.boolean(),
-  stalled: z.boolean(),
-  hint: z.string().optional(),
-  next_step: z.string().optional(),
-  error: z.string().optional(),
-  activity: z.array(runEventSummarySchema),
-  todos: z.array(todoItemSchema),
-};
-
-const runProgressSchema = z.object(runProgressShape);
-
-const runActivityWaitResultSchema = z.object({
-  ...runProgressShape,
-  reason: z.enum(["terminal", "activity", "timeout"]),
-  waited_seconds: z.number(),
-  timeout_seconds: z.number(),
-});
-
-const reportResultSchema = z.object({
-  report: z.string(),
-  title: z.string().nullable().optional(),
-  summary_text: z.string().nullable().optional(),
-  artifacts: z.array(z.string()),
-  web_url: z.string(),
-  terminal: z.boolean().optional(),
-  run_status: runStatusSchema.optional(),
-  report_source: z.enum(["run-messages", "state-messages", "summary", "artifact"]).optional(),
-  artifact_note: z.string().optional(),
-});
-
 const threadSummarySchema = z.object({
   thread_id: z.string(),
   status: z.string().optional(),
@@ -204,43 +120,17 @@ const modelListResultSchema = z.object({
   models: z.array(modelInfoSchema),
 });
 
-const tokenUsageByModelSchema = z.object({
-  tokens: z.number(),
-  runs: z.number(),
-});
-
-const tokenUsageByCallerSchema = z.object({
-  lead_agent: z.number(),
-  subagent: z.number(),
-  middleware: z.number(),
-});
-
-const tokenUsageContextSchema = z.object({
-  token_count: z.number(),
-  max_context_tokens: z.number().nullable(),
-  percentage: z.number().nullable(),
-});
-
-const tokenUsageResultSchema = z.object({
-  thread_id: z.string(),
-  total_tokens: z.number(),
-  total_input_tokens: z.number(),
-  total_output_tokens: z.number(),
-  total_runs: z.number(),
-  by_model: z.record(z.string(), tokenUsageByModelSchema),
-  by_caller: tokenUsageByCallerSchema,
-  context_usage: tokenUsageContextSchema.nullable(),
-});
-
 // ---------------------------------------------------------------------------
 // Tool registration
 // ---------------------------------------------------------------------------
 
 /**
  * Register the DeerFlow toolset on an MCP server. Each tool is a thin wrapper
- * over a {@link DeerFlowClient} method and returns both a human-readable text
- * block and machine-readable `structuredContent` (validated against
- * `outputSchema`).
+ * over a {@link DeerFlowClient} method. Most tools return both a human-readable
+ * text block and machine-readable `structuredContent` (validated against
+ * `outputSchema`); the display tools (run_status, run_progress, wait_activity,
+ * get_report, token_usage) return text only so clients render them as legible
+ * output instead of a JSON blob.
  */
 export function registerTools(server: McpServer, client: DeerFlowClient): void {
   server.registerTool(
@@ -345,7 +235,6 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           .optional()
           .describe("Seconds to poll for a terminal status before returning (0 = check once)."),
       }),
-      outputSchema: runStatusResultSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -358,11 +247,8 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
         const run = await client.waitForRun(args.thread_id, args.run_id, args.wait_seconds ?? 0);
         const now = Date.now();
         const createdMs = parseIsoMs(run.created_at);
-        const updatedMs = parseIsoMs(run.updated_at);
         const elapsedSeconds =
           createdMs !== undefined ? Math.max(0, Math.round((now - createdMs) / 1000)) : undefined;
-        const secondsSinceUpdate =
-          updatedMs !== undefined ? Math.max(0, Math.round((now - updatedMs) / 1000)) : undefined;
 
         const view: RunStatusView = {
           run_id: run.run_id,
@@ -378,36 +264,7 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           ...(run.llm_call_count !== undefined ? { llm_call_count: run.llm_call_count } : {}),
           ...(run.message_count !== undefined ? { message_count: run.message_count } : {}),
         };
-
-        const out: Record<string, unknown> = {
-          thread_id: run.thread_id,
-          run_id: run.run_id,
-          status: run.status,
-          stop_reason: run.stop_reason ?? null,
-          terminal: isTerminalRunStatus(run.status),
-          ...(elapsedSeconds !== undefined ? { elapsed_seconds: elapsedSeconds } : {}),
-          ...(secondsSinceUpdate !== undefined
-            ? { updated_at: run.updated_at, seconds_since_update: secondsSinceUpdate }
-            : {}),
-          ...(run.total_tokens !== undefined ? { total_tokens: run.total_tokens } : {}),
-          ...(run.total_input_tokens !== undefined
-            ? { total_input_tokens: run.total_input_tokens }
-            : {}),
-          ...(run.total_output_tokens !== undefined
-            ? { total_output_tokens: run.total_output_tokens }
-            : {}),
-          ...(run.lead_agent_tokens !== undefined
-            ? { lead_agent_tokens: run.lead_agent_tokens }
-            : {}),
-          ...(run.subagent_tokens !== undefined ? { subagent_tokens: run.subagent_tokens } : {}),
-          ...(run.middleware_tokens !== undefined
-            ? { middleware_tokens: run.middleware_tokens }
-            : {}),
-          ...(run.llm_call_count !== undefined ? { llm_call_count: run.llm_call_count } : {}),
-          ...(run.message_count !== undefined ? { message_count: run.message_count } : {}),
-          ...(run.error ? { error: run.error } : {}),
-        };
-        return textResult(formatRunStatus(view), out);
+        return textResult(formatRunStatus(view));
       })
   );
 
@@ -436,7 +293,6 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           .optional()
           .describe("Maximum recent events to summarize (default 10)."),
       }),
-      outputSchema: runProgressSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -450,7 +306,7 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           sinceSeq: args.since_seq,
           activityLimit: args.activity_limit,
         });
-        return textResult(formatProgress(progress), progress);
+        return textResult(formatProgress(progress));
       })
   );
 
@@ -479,7 +335,6 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           .optional()
           .describe("Maximum seconds to wait before returning (default 30, capped server-side)."),
       }),
-      outputSchema: runActivityWaitResultSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -526,7 +381,7 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
 
         // Final progress update signalling completion (progress reaches total).
         await emit(result.timeout_seconds, `Wait complete: ${result.reason}`);
-        return textResult(formatProgress(result), result);
+        return textResult(formatProgress(result));
       })
   );
 
@@ -543,7 +398,6 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           .optional()
           .describe("Optional run id to scope the report to a specific run."),
       }),
-      outputSchema: reportResultSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -554,7 +408,7 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
     (args) =>
       withTool(async () => {
         const report = await client.getReport(args.thread_id, args.run_id);
-        return textResult(formatReport(report), report);
+        return textResult(formatReport(report));
       })
   );
 
@@ -722,7 +576,6 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
       inputSchema: z.object({
         thread_id: z.string().describe("The thread id."),
       }),
-      outputSchema: tokenUsageResultSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -733,7 +586,7 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
     (args) =>
       withTool(async () => {
         const usage = await client.getTokenUsage(args.thread_id);
-        return textResult(formatTokenUsage(usage), usage);
+        return textResult(formatTokenUsage(usage));
       })
   );
 }

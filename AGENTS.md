@@ -67,8 +67,9 @@ test/             # Vitest tests (mirror the src/ layout)
 > CLI and transport; `src/lib/tools.ts` registers the DeerFlow tools on the `McpServer`:
 > `research`, `chat`, `run_status`, `run_progress`, `wait_activity`, `get_report`,
 > `list_threads`, `cancel_run`, `list_artifacts`, `get_artifact`, `list_models`, and
-> `token_usage`. The `run_progress`/`wait_activity`/`run_status` tools return legible
-> multi-line `content` (built by `format.ts`) plus the full object as `structuredContent`.
+> `token_usage`. The `run_progress`/`wait_activity`/`run_status`/`get_report`/`token_usage`
+> tools return legible multi-line `content` (built by `format.ts`) only — no
+> `structuredContent` — so clients render them as text instead of a JSON blob.
 >
 > **Tool naming**: tools are registered with short names (no `deerflow_` prefix). The MCP
 > client prepends the server name `deerflow_`, so clients see `deerflow_research`,
@@ -106,12 +107,14 @@ mode for full access.
 - Use the **v2** SDK: `import { McpServer } from "@modelcontextprotocol/server"` and
   `new McpServer({ name, version })`.
 - Register tools with `server.registerTool(name, { description, inputSchema, outputSchema }, handler)`.
-- Tool input **and** output schemas use **Standard Schema** — use `zod` v4. Every tool
-  advertises an `outputSchema` and returns **both** a human-readable `content` text block
-  and a machine-readable `structuredContent` that matches it. The MCP client validates
-  `structuredContent` against `outputSchema` and **throws on a non-error result that omits
-  it**, so success paths must always return both; error results (`isError: true`) omit
-  `structuredContent`.
+- Tool input **and** output schemas use **Standard Schema** — use `zod` v4. Most tools
+  advertise an `outputSchema` and return **both** a human-readable `content` text block
+  and a machine-readable `structuredContent` that matches it; the display tools
+  (`run_status`, `run_progress`, `wait_activity`, `get_report`, `token_usage`) return
+  `content` only (no `outputSchema`, no `structuredContent`). The MCP client validates
+  `structuredContent` against `outputSchema` and **throws on a non-error result that
+  omits it**, so a tool that advertises an `outputSchema` must always return
+  `structuredContent`; error results (`isError: true`) omit it.
 - Transports: stdio via `@modelcontextprotocol/server/stdio`; HTTP via the
   `@modelcontextprotocol/node` Streamable HTTP wrapper. The CLI selects the transport
   (`--transport`); the `start` script defaults to `http`.

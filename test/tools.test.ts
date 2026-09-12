@@ -109,7 +109,7 @@ describe("MCP tools", () => {
     );
   });
 
-  it("deerflow_run_status returns status, a terminal flag, and live counters", async () => {
+  it("deerflow_run_status returns status and live counters as text", async () => {
     await withTools(
       () => ({
         body: {
@@ -139,23 +139,13 @@ describe("MCP tools", () => {
         expect(text).toContain("12,345 in / 28,073 out");
         expect(text).toContain("20 LLM calls");
         expect(text).toContain("52 messages");
-        const sc = res.structuredContent as {
-          status: string;
-          terminal: boolean;
-          total_tokens: number;
-          total_input_tokens: number;
-          lead_agent_tokens: number;
-        };
-        expect(sc.status).toBe("success");
-        expect(sc.terminal).toBe(true);
-        expect(sc.total_tokens).toBe(40418);
-        expect(sc.total_input_tokens).toBe(12345);
-        expect(sc.lead_agent_tokens).toBe(30000);
+        // Display tool: text only, no structuredContent.
+        expect(res.structuredContent).toBeUndefined();
       }
     );
   });
 
-  it("deerflow_run_progress returns activity, todos, and stall detection", async () => {
+  it("deerflow_run_progress returns activity, todos, and counters as text", async () => {
     const now = Date.now();
     const recent = new Date(now - 10_000).toISOString();
     const started = new Date(now - 40 * 60_000).toISOString();
@@ -217,9 +207,8 @@ describe("MCP tools", () => {
         expect(text).toContain("[ ] Write report");
         expect(text).toContain("web_search(vLLM v0.25.0)");
         expect(text).toContain("web_search → 10 results found");
-        const sc = res.structuredContent as { stalled: boolean; last_event_seq: number };
-        expect(sc.stalled).toBe(false);
-        expect(sc.last_event_seq).toBe(10);
+        // Display tool: text only, no structuredContent.
+        expect(res.structuredContent).toBeUndefined();
       }
     );
   });
@@ -253,9 +242,8 @@ describe("MCP tools", () => {
         const text = textOf(res);
         expect(text).toContain("web_search → done");
         expect(text).toContain("Wait: new activity after");
-        const sc = res.structuredContent as { reason: string; last_event_seq: number };
-        expect(sc.reason).toBe("activity");
-        expect(sc.last_event_seq).toBe(11);
+        // Display tool: text only, no structuredContent.
+        expect(res.structuredContent).toBeUndefined();
       }
     );
   });
@@ -403,14 +391,8 @@ describe("MCP tools", () => {
         expect(text).toContain("By model:");
         expect(text).toContain("gpt-x 100,000 (2 runs)");
         expect(text).toContain("By caller: lead 100,000 · subagent 20,000 · middleware 8,410");
-        const sc = res.structuredContent as {
-          total_tokens: number;
-          by_caller: { lead_agent: number };
-          context_usage: { percentage: number | null };
-        };
-        expect(sc.total_tokens).toBe(128410);
-        expect(sc.by_caller.lead_agent).toBe(100000);
-        expect(sc.context_usage.percentage).toBe(62);
+        // Display tool: text only, no structuredContent.
+        expect(res.structuredContent).toBeUndefined();
       }
     );
   });
@@ -451,46 +433,6 @@ describe("MCP tools", () => {
           status: "pending",
           web_url: "https://deer.example.com/workspace/chats/t-9",
         });
-      }
-    );
-  });
-
-  it("deerflow_wait_activity returns structuredContent with reason and timeout_seconds", async () => {
-    const now = Date.now();
-    const recent = new Date(now - 1_000).toISOString();
-    const started = new Date(now - 40 * 60_000).toISOString();
-    await withTools(
-      (call) => {
-        if (call.url.includes("/runs/r-1/join")) return { status: 404, body: {} };
-        if (call.url.includes("/runs/r-1/events"))
-          return {
-            body: [
-              {
-                seq: 11,
-                event_type: "llm.tool.result",
-                created_at: recent,
-                content: { type: "tool", name: "web_search", content: "done" },
-              },
-            ],
-          };
-        if (call.url.endsWith("/state")) return { body: { values: { todos: [] } } };
-        return { body: { run_id: "r-1", status: "running", created_at: started } };
-      },
-      async (client) => {
-        const res = await client.callTool({
-          name: "wait_activity",
-          arguments: { thread_id: "t-1", run_id: "r-1", since_seq: 10, timeout_seconds: 5 },
-        });
-        expect(res.isError).toBeFalsy();
-        const structured = res.structuredContent as {
-          reason: string;
-          timeout_seconds: number;
-          waited_seconds: number;
-          last_event_seq: number;
-        };
-        expect(structured.reason).toBe("activity");
-        expect(structured.timeout_seconds).toBe(5);
-        expect(structured.last_event_seq).toBe(11);
       }
     );
   });
