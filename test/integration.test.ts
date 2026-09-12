@@ -20,17 +20,18 @@ const PKG_ROOT = path.resolve(fileURLToPath(new URL(".", import.meta.url)), ".."
 const DIST = path.join(PKG_ROOT, "dist", "index.js");
 
 const ALL_TOOLS = [
-  "deerflow_cancel_run",
-  "deerflow_chat",
-  "deerflow_get_artifact",
-  "deerflow_get_report",
-  "deerflow_list_artifacts",
-  "deerflow_list_models",
-  "deerflow_list_threads",
-  "deerflow_research",
-  "deerflow_run_progress",
-  "deerflow_run_status",
-  "deerflow_wait_activity",
+  "cancel_run",
+  "chat",
+  "get_artifact",
+  "get_report",
+  "list_artifacts",
+  "list_models",
+  "list_threads",
+  "research",
+  "run_progress",
+  "run_status",
+  "token_usage",
+  "wait_activity",
 ].sort();
 
 // --- Stub DeerFlow API ------------------------------------------------------
@@ -275,26 +276,26 @@ describe.each([
     await client.close();
   });
 
-  test("lists the eleven DeerFlow tools with derived input schemas", async () => {
+  test("lists the twelve DeerFlow tools with derived input schemas", async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(ALL_TOOLS);
 
     // The zod v4 schemas must survive the MCP wire as JSON Schema.
-    const research = tools.find((t) => t.name === "deerflow_research")!;
+    const research = tools.find((t) => t.name === "research")!;
     expect(Object.keys(research.inputSchema.properties ?? {}).sort()).toEqual([
       "focus",
       "model",
       "recursion_limit",
       "topic",
     ]);
-    const report = tools.find((t) => t.name === "deerflow_get_report")!;
+    const report = tools.find((t) => t.name === "get_report")!;
     expect(report.annotations?.readOnlyHint).toBe(true);
   });
 
   test("deerflow_research creates a thread and run on the wire", async () => {
     requests.length = 0;
     const res = await client.callTool({
-      name: "deerflow_research",
+      name: "research",
       arguments: { topic: "AI safety" },
     });
     expect(res.isError).toBeFalsy();
@@ -319,7 +320,7 @@ describe.each([
   test("deerflow_run_status polls until the run reaches a terminal status", async () => {
     requests.length = 0;
     const started = await client.callTool({
-      name: "deerflow_chat",
+      name: "chat",
       arguments: { message: "hello" },
     });
     const startedText = textOf(started);
@@ -328,12 +329,13 @@ describe.each([
     expect(threadId && runId).toBeTruthy();
 
     const res = await client.callTool({
-      name: "deerflow_run_status",
+      name: "run_status",
       arguments: { thread_id: threadId!, run_id: runId!, wait_seconds: 5 },
     });
-    const text = textOf(res);
-    expect(text).toContain('"status": "success"');
-    expect(text).toContain('"terminal": true');
+    expect(textOf(res)).toContain(`Run ${runId} — success`);
+    const sc = res.structuredContent as { status: string; terminal: boolean };
+    expect(sc.status).toBe("success");
+    expect(sc.terminal).toBe(true);
 
     // The stub answers "running" on the first poll and "success" after, so
     // the wait loop must have polled at least twice.
@@ -343,14 +345,14 @@ describe.each([
 
   test("deerflow_get_report returns the synthesized report", async () => {
     const started = await client.callTool({
-      name: "deerflow_chat",
+      name: "chat",
       arguments: { message: "write a report" },
     });
     const threadId = textOf(started).match(/"thread_id": "(t-\d+)"/)?.[1];
     expect(threadId).toBeTruthy();
 
     const res = await client.callTool({
-      name: "deerflow_get_report",
+      name: "get_report",
       arguments: { thread_id: threadId! },
     });
     expect(res.isError).toBeFalsy();
@@ -364,7 +366,7 @@ describe.each([
   test("deerflow_wait_activity joins the run stream and reports a terminal result", async () => {
     requests.length = 0;
     const started = await client.callTool({
-      name: "deerflow_chat",
+      name: "chat",
       arguments: { message: "wait for me" },
     });
     const threadId = textOf(started).match(/"thread_id": "(t-\d+)"/)?.[1];
@@ -372,11 +374,12 @@ describe.each([
     expect(threadId && runId).toBeTruthy();
 
     const res = await client.callTool({
-      name: "deerflow_wait_activity",
+      name: "wait_activity",
       arguments: { thread_id: threadId!, run_id: runId!, timeout_seconds: 5 },
     });
     expect(res.isError).toBeFalsy();
-    expect(textOf(res)).toContain('"reason": "terminal"');
+    expect(textOf(res)).toContain("Wait: run reached terminal status (success)");
+    expect((res.structuredContent as { reason: string }).reason).toBe("terminal");
 
     // The server must have attempted to join the run's live event stream.
     const join = requests.find((r) => r.path === `/api/threads/${threadId}/runs/${runId}/join`);
@@ -390,7 +393,7 @@ describe.each([
     expect(uris).toContain("deerflow://threads/{threadId}/artifacts/{+path}");
 
     const started = await client.callTool({
-      name: "deerflow_chat",
+      name: "chat",
       arguments: { message: "write a report" },
     });
     const threadId = textOf(started).match(/"thread_id": "(t-\d+)"/)?.[1];
@@ -465,7 +468,7 @@ describe("process lifecycle", () => {
     delete env.DEERFLOW_PAT;
     const client = await connectStdio(env);
     try {
-      const res = await client.callTool({ name: "deerflow_list_models", arguments: {} });
+      const res = await client.callTool({ name: "list_models", arguments: {} });
       expect(res.isError).toBeFalsy();
       expect(textOf(res)).toContain('"name": "gpt-x"');
 
@@ -489,7 +492,7 @@ describe("process lifecycle", () => {
     const env = { ...childEnv, DEERFLOW_BASE_URL: `http://127.0.0.1:${address.port}` };
     const client = await connectStdio(env);
     try {
-      const res = await client.callTool({ name: "deerflow_list_models", arguments: {} });
+      const res = await client.callTool({ name: "list_models", arguments: {} });
       expect(res.isError).toBe(true);
       const text = textOf(res);
       expect(text).toContain("401");

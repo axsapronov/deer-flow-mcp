@@ -13,6 +13,8 @@ import type {
   RunStatus,
   ThreadSummary,
   TodoItem,
+  TokenUsage,
+  TokenUsageByModel,
 } from "./types.js";
 import { isTerminalRunStatus } from "./types.js";
 import { buildResearchPrompt, type ResearchPromptOptions } from "./prompts.js";
@@ -549,6 +551,19 @@ export class DeerFlowClient {
       `/api/threads/${encodeURIComponent(threadId)}/state`
     );
     return data ?? {};
+  }
+
+  /**
+   * Thread-level token-usage aggregate (from
+   * `GET /api/threads/{id}/token-usage?include_active=true`). `include_active`
+   * folds the in-progress run's progress snapshot into the totals. Missing
+   * breakdowns normalize to empty/zero so a partial response never throws.
+   */
+  async getTokenUsage(threadId: string): Promise<TokenUsage> {
+    const data = await this.requestJson<RawTokenUsage>(
+      `/api/threads/${encodeURIComponent(threadId)}/token-usage?include_active=true`
+    );
+    return normalizeTokenUsage(data, threadId);
   }
 
   // --- Runs --------------------------------------------------------------
@@ -1128,6 +1143,11 @@ interface RawRunResponse {
   created_at?: string;
   updated_at?: string;
   total_tokens?: number;
+  total_input_tokens?: number;
+  total_output_tokens?: number;
+  lead_agent_tokens?: number;
+  subagent_tokens?: number;
+  middleware_tokens?: number;
   llm_call_count?: number;
   message_count?: number;
   /**
@@ -1137,6 +1157,22 @@ interface RawRunResponse {
    * reads into `RunProgress.error`.
    */
   error?: string | null;
+}
+
+/** Raw shape of `GET /api/threads/{id}/token-usage` (all fields optional). */
+interface RawTokenUsage {
+  thread_id?: string;
+  total_tokens?: number;
+  total_input_tokens?: number;
+  total_output_tokens?: number;
+  total_runs?: number;
+  by_model?: Record<string, { tokens?: number; runs?: number }>;
+  by_caller?: { lead_agent?: number; subagent?: number; middleware?: number };
+  context_usage?: {
+    token_count?: number;
+    max_context_tokens?: number | null;
+    percentage?: number | null;
+  } | null;
 }
 
 /**
@@ -1178,9 +1214,63 @@ function normalizeRun(raw: RawRunResponse | undefined, threadId: string): RunInf
     created_at: raw.created_at,
     updated_at: raw.updated_at,
     ...(raw.total_tokens !== undefined ? { total_tokens: raw.total_tokens } : {}),
+    ...(raw.total_input_tokens !== undefined ? { total_input_tokens: raw.total_input_tokens } : {}),
+    ...(raw.total_output_tokens !== undefined
+      ? { total_output_tokens: raw.total_output_tokens }
+      : {}),
+    ...(raw.lead_agent_tokens !== undefined ? { lead_agent_tokens: raw.lead_agent_tokens } : {}),
+    ...(raw.subagent_tokens !== undefined ? { subagent_tokens: raw.subagent_tokens } : {}),
+    ...(raw.middleware_tokens !== undefined ? { middleware_tokens: raw.middleware_tokens } : {}),
     ...(raw.llm_call_count !== undefined ? { llm_call_count: raw.llm_call_count } : {}),
     ...(raw.message_count !== undefined ? { message_count: raw.message_count } : {}),
     ...(raw.error ? { error: raw.error } : {}),
+  };
+}
+
+/** Coerce a possibly-missing/invalid number to a safe finite number (default 0). */
+function toSafeNumber(value: number | undefined | null): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+/**
+ * Normalize a raw token-usage response into a {@link TokenUsage} with safe
+ * defaults: missing `by_model`/`by_caller` become empty, `context_usage`
+ * becomes `null`, and any missing number becomes `0`.
+ */
+function normalizeTokenUsage(raw: RawTokenUsage | undefined, threadId: string): TokenUsage {
+  const byModel: Record<string, TokenUsageByModel> = {};
+  const rawModel = raw?.by_model;
+  if (rawModel && typeof rawModel === "object") {
+    for (const [name, entry] of Object.entries(rawModel)) {
+      byModel[name] = {
+        tokens: toSafeNumber(entry?.tokens),
+        runs: toSafeNumber(entry?.runs),
+      };
+    }
+  }
+  const caller = raw?.by_caller ?? {};
+  const context = raw?.context_usage;
+  return {
+    thread_id: raw?.thread_id ?? threadId,
+    total_tokens: toSafeNumber(raw?.total_tokens),
+    total_input_tokens: toSafeNumber(raw?.total_input_tokens),
+    total_output_tokens: toSafeNumber(raw?.total_output_tokens),
+    total_runs: toSafeNumber(raw?.total_runs),
+    by_model: byModel,
+    by_caller: {
+      lead_agent: toSafeNumber(caller.lead_agent),
+      subagent: toSafeNumber(caller.subagent),
+      middleware: toSafeNumber(caller.middleware),
+    },
+    context_usage:
+      context && typeof context === "object"
+        ? {
+            token_count: toSafeNumber(context.token_count),
+            max_context_tokens:
+              typeof context.max_context_tokens === "number" ? context.max_context_tokens : null,
+            percentage: typeof context.percentage === "number" ? context.percentage : null,
+          }
+        : null,
   };
 }
 
@@ -1367,9 +1457,81 @@ export function summarizeRunEvent(evt: RawRunEvent): RunEventSummary {
         summary: msg ? `delivery: ${oneLine(msg, 100)}` : "run delivered",
       };
     }
+    case "subagent.start": {
+      const content = asRecord(evt.content);
+      const taskId = subagentTaskId(evt, content);
+      const description =
+        typeof content?.description === "string" && content.description
+          ? oneLine(content.description, 120)
+          : undefined;
+      const summary = description
+        ? `subagent start: ${description}`
+        : taskId !== "?"
+          ? `subagent start (${taskId})`
+          : "subagent start";
+      return { ...base, kind: "other", summary };
+    }
+    case "subagent.step": {
+      const content = asRecord(evt.content);
+      const taskId = subagentTaskId(evt, content);
+      const kind = typeof content?.kind === "string" ? content.kind : undefined;
+      const text = typeof content?.text === "string" ? content.text : undefined;
+      let summary: string;
+      if (kind === "tool") {
+        const toolName =
+          typeof content?.tool_name === "string" && content.tool_name ? content.tool_name : "tool";
+        summary = text
+          ? `subagent[${taskId}] ${toolName}: ${oneLine(text, 100)}`
+          : `subagent[${taskId}] ${toolName}`;
+      } else if (kind === "ai") {
+        const toolCalls = Array.isArray(content?.tool_calls) ? content.tool_calls : [];
+        if (text && text.trim()) {
+          summary = `subagent[${taskId}] ai: ${oneLine(text, 100)}`;
+        } else if (toolCalls.length > 0) {
+          const names = toolCalls
+            .map((tc) => {
+              const t = asRecord(tc);
+              return typeof t?.name === "string" && t.name ? t.name : "tool";
+            })
+            .slice(0, 3)
+            .join(", ");
+          summary = `subagent[${taskId}] tool_calls: ${names}`;
+        } else {
+          summary = `subagent[${taskId}] ai`;
+        }
+      } else {
+        summary = text
+          ? `subagent[${taskId}] step: ${oneLine(text, 100)}`
+          : `subagent[${taskId}] step`;
+      }
+      return { ...base, kind: "other", summary };
+    }
+    case "subagent.end": {
+      const content = asRecord(evt.content);
+      const taskId = subagentTaskId(evt, content);
+      const status =
+        typeof content?.status === "string" && content.status ? content.status : "ended";
+      const error =
+        typeof content?.error === "string" && content.error
+          ? ` — ${oneLine(content.error, 80)}`
+          : "";
+      return { ...base, kind: "other", summary: `subagent[${taskId}] ${status}${error}` };
+    }
     default:
       return { ...base, kind: "other", summary: type };
   }
+}
+
+/**
+ * Best-effort subagent task id for a `subagent.*` event: read from `content`
+ * first (the persisted payload carries it), then fall back to `metadata`.
+ * Returns "?" when neither has it so callers can degrade gracefully.
+ */
+function subagentTaskId(evt: RawRunEvent, content?: Record<string, unknown>): string {
+  if (content && typeof content.task_id === "string" && content.task_id) return content.task_id;
+  const meta = asRecord(evt.metadata);
+  if (meta && typeof meta.task_id === "string" && meta.task_id) return meta.task_id;
+  return "?";
 }
 
 /**
@@ -1473,6 +1635,13 @@ export function composeProgress(
     elapsed_seconds: elapsedSeconds,
     ...(secondsSinceUpdate !== undefined ? { seconds_since_update: secondsSinceUpdate } : {}),
     ...(run.total_tokens !== undefined ? { total_tokens: run.total_tokens } : {}),
+    ...(run.total_input_tokens !== undefined ? { total_input_tokens: run.total_input_tokens } : {}),
+    ...(run.total_output_tokens !== undefined
+      ? { total_output_tokens: run.total_output_tokens }
+      : {}),
+    ...(run.lead_agent_tokens !== undefined ? { lead_agent_tokens: run.lead_agent_tokens } : {}),
+    ...(run.subagent_tokens !== undefined ? { subagent_tokens: run.subagent_tokens } : {}),
+    ...(run.middleware_tokens !== undefined ? { middleware_tokens: run.middleware_tokens } : {}),
     ...(run.llm_call_count !== undefined ? { llm_call_count: run.llm_call_count } : {}),
     ...(run.message_count !== undefined ? { message_count: run.message_count } : {}),
     ...(lastEventSeq !== undefined ? { last_event_seq: lastEventSeq } : {}),
@@ -1534,6 +1703,21 @@ export function buildWaitResult(
         ? { seconds_since_activity: progress.seconds_since_activity }
         : {}),
       ...(progress.total_tokens !== undefined ? { total_tokens: progress.total_tokens } : {}),
+      ...(progress.total_input_tokens !== undefined
+        ? { total_input_tokens: progress.total_input_tokens }
+        : {}),
+      ...(progress.total_output_tokens !== undefined
+        ? { total_output_tokens: progress.total_output_tokens }
+        : {}),
+      ...(progress.lead_agent_tokens !== undefined
+        ? { lead_agent_tokens: progress.lead_agent_tokens }
+        : {}),
+      ...(progress.subagent_tokens !== undefined
+        ? { subagent_tokens: progress.subagent_tokens }
+        : {}),
+      ...(progress.middleware_tokens !== undefined
+        ? { middleware_tokens: progress.middleware_tokens }
+        : {}),
       ...(progress.llm_call_count !== undefined ? { llm_call_count: progress.llm_call_count } : {}),
       ...(progress.message_count !== undefined ? { message_count: progress.message_count } : {}),
       ...(progress.last_event_seq !== undefined ? { last_event_seq: progress.last_event_seq } : {}),
@@ -1617,7 +1801,7 @@ function formatHttpError(
     case 403:
       return `DeerFlow denied this operation (403).${
         authKind === "pat"
-          ? " With a Personal Access Token, /api/models and artifact downloads are not in the PAT route allowlist — use an internal token for those."
+          ? " With a Personal Access Token, /api/models, thread token-usage (/token-usage), and artifact downloads are not in the PAT route allowlist — use an internal token for those."
           : authKind === "session"
             ? " The session is not authorized for this operation."
             : ""

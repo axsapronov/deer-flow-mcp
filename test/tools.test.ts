@@ -6,17 +6,18 @@ import { registerTools } from "../src/lib/tools.js";
 import { makeConfig, createMockFetch, type MockCall, type MockResponse } from "./helpers.js";
 
 const ALL_TOOLS = [
-  "deerflow_cancel_run",
-  "deerflow_chat",
-  "deerflow_get_artifact",
-  "deerflow_get_report",
-  "deerflow_list_artifacts",
-  "deerflow_list_models",
-  "deerflow_list_threads",
-  "deerflow_research",
-  "deerflow_run_progress",
-  "deerflow_run_status",
-  "deerflow_wait_activity",
+  "cancel_run",
+  "chat",
+  "get_artifact",
+  "get_report",
+  "list_artifacts",
+  "list_models",
+  "list_threads",
+  "research",
+  "run_progress",
+  "run_status",
+  "token_usage",
+  "wait_activity",
 ].sort();
 
 /**
@@ -52,7 +53,7 @@ function textOf(result: { content: unknown[] }): string {
 }
 
 describe("MCP tools", () => {
-  it("registers exactly the eleven expected tools", async () => {
+  it("registers exactly the twelve expected tools", async () => {
     await withTools(
       () => ({ body: {} }),
       async (client) => {
@@ -72,7 +73,7 @@ describe("MCP tools", () => {
       },
       async (client, calls) => {
         const res = await client.callTool({
-          name: "deerflow_research",
+          name: "research",
           arguments: { topic: "AI safety" },
         });
         expect(res.isError).toBeFalsy();
@@ -95,7 +96,7 @@ describe("MCP tools", () => {
       },
       async (client, calls) => {
         const res = await client.callTool({
-          name: "deerflow_chat",
+          name: "chat",
           arguments: { message: "follow up", thread_id: "t-existing" },
         });
         expect(res.isError).toBeFalsy();
@@ -119,21 +120,37 @@ describe("MCP tools", () => {
           updated_at: "2026-09-12T04:00:00.000Z",
           llm_call_count: 20,
           message_count: 52,
-          total_tokens: 1000,
+          total_tokens: 40418,
+          total_input_tokens: 12345,
+          total_output_tokens: 28073,
+          lead_agent_tokens: 30000,
+          subagent_tokens: 8000,
+          middleware_tokens: 2418,
         },
       }),
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_run_status",
+          name: "run_status",
           arguments: { thread_id: "t-1", run_id: "r-1" },
         });
         const text = textOf(res);
-        expect(text).toContain('"status": "success"');
-        expect(text).toContain('"terminal": true');
-        expect(text).toContain('"llm_call_count": 20');
-        expect(text).toContain('"message_count": 52');
-        expect(text).toContain('"total_tokens": 1000');
-        expect(text).toContain('"elapsed_seconds"');
+        expect(text).toContain("Run r-1 — success");
+        expect(text).toContain("40,418 tokens");
+        expect(text).toContain("12,345 in / 28,073 out");
+        expect(text).toContain("20 LLM calls");
+        expect(text).toContain("52 messages");
+        const sc = res.structuredContent as {
+          status: string;
+          terminal: boolean;
+          total_tokens: number;
+          total_input_tokens: number;
+          lead_agent_tokens: number;
+        };
+        expect(sc.status).toBe("success");
+        expect(sc.terminal).toBe(true);
+        expect(sc.total_tokens).toBe(40418);
+        expect(sc.total_input_tokens).toBe(12345);
+        expect(sc.lead_agent_tokens).toBe(30000);
       }
     );
   });
@@ -188,17 +205,21 @@ describe("MCP tools", () => {
       },
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_run_progress",
+          name: "run_progress",
           arguments: { thread_id: "t-1", run_id: "r-1" },
         });
         expect(res.isError).toBeFalsy();
         const text = textOf(res);
-        expect(text).toContain('"status": "running"');
-        expect(text).toContain('"stalled": false');
+        expect(text).toContain("DeerFlow run r-1 — running");
+        expect(text).toContain("LLM calls: 20");
+        expect(text).toContain('now: "Gather history"');
+        expect(text).toContain("[>] Gather history");
+        expect(text).toContain("[ ] Write report");
         expect(text).toContain("web_search(vLLM v0.25.0)");
         expect(text).toContain("web_search → 10 results found");
-        expect(text).toContain('"Gather history"');
-        expect(text).toContain('"last_event_seq": 10');
+        const sc = res.structuredContent as { stalled: boolean; last_event_seq: number };
+        expect(sc.stalled).toBe(false);
+        expect(sc.last_event_seq).toBe(10);
       }
     );
   });
@@ -225,14 +246,16 @@ describe("MCP tools", () => {
       },
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_wait_activity",
+          name: "wait_activity",
           arguments: { thread_id: "t-1", run_id: "r-1", since_seq: 10, timeout_seconds: 5 },
         });
         expect(res.isError).toBeFalsy();
         const text = textOf(res);
-        expect(text).toContain('"reason": "activity"');
-        expect(text).toContain('"last_event_seq": 11');
         expect(text).toContain("web_search → done");
+        expect(text).toContain("Wait: new activity after");
+        const sc = res.structuredContent as { reason: string; last_event_seq: number };
+        expect(sc.reason).toBe("activity");
+        expect(sc.last_event_seq).toBe(11);
       }
     );
   });
@@ -250,7 +273,7 @@ describe("MCP tools", () => {
       }),
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_get_report",
+          name: "get_report",
           arguments: { thread_id: "t-1" },
         });
         const text = textOf(res);
@@ -279,7 +302,7 @@ describe("MCP tools", () => {
           : { body: {} },
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_list_threads",
+          name: "list_threads",
           arguments: { limit: 5 },
         });
         const text = textOf(res);
@@ -294,7 +317,7 @@ describe("MCP tools", () => {
       () => ({ status: 202, text: "" }),
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_cancel_run",
+          name: "cancel_run",
           arguments: { thread_id: "t-1", run_id: "r-1" },
         });
         expect(res.isError).toBeFalsy();
@@ -308,7 +331,7 @@ describe("MCP tools", () => {
       () => ({ body: { values: { artifacts: ["a.md", "b.csv"] } } }),
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_list_artifacts",
+          name: "list_artifacts",
           arguments: { thread_id: "t-1" },
         });
         const text = textOf(res);
@@ -323,7 +346,7 @@ describe("MCP tools", () => {
       () => ({ text: "# Report\nbody", headers: { "content-type": "text/markdown" } }),
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_get_artifact",
+          name: "get_artifact",
           arguments: { thread_id: "t-1", path: "mnt/user-data/outputs/a.md" },
         });
         const text = textOf(res);
@@ -339,10 +362,55 @@ describe("MCP tools", () => {
         body: { models: [{ name: "gpt-x", display_name: "GPT X", supports_thinking: true }] },
       }),
       async (client) => {
-        const res = await client.callTool({ name: "deerflow_list_models", arguments: {} });
+        const res = await client.callTool({ name: "list_models", arguments: {} });
         const text = textOf(res);
         expect(text).toContain('"name": "gpt-x"');
         expect(text).toContain('"supports_thinking": true');
+      }
+    );
+  });
+
+  it("token_usage returns the thread-level token breakdown", async () => {
+    await withTools(
+      () => ({
+        body: {
+          thread_id: "t-1",
+          total_tokens: 128410,
+          total_input_tokens: 90000,
+          total_output_tokens: 38410,
+          total_runs: 3,
+          by_model: {
+            "gpt-x": { tokens: 100000, runs: 2 },
+            "claude-3-7": { tokens: 28410, runs: 1 },
+          },
+          by_caller: { lead_agent: 100000, subagent: 20000, middleware: 8410 },
+          context_usage: { token_count: 124000, max_context_tokens: 200000, percentage: 62 },
+        },
+      }),
+      async (client, calls) => {
+        const res = await client.callTool({
+          name: "token_usage",
+          arguments: { thread_id: "t-1" },
+        });
+        expect(res.isError).toBeFalsy();
+        // The client must hit the thread token-usage endpoint with include_active.
+        expect(calls.some((c) => c.url.endsWith("/token-usage?include_active=true"))).toBe(true);
+        const text = textOf(res);
+        expect(text).toContain(
+          "Tokens (thread t-1): 128,410 total (90,000 in / 38,410 out) across 3 runs"
+        );
+        expect(text).toContain("context 62% (124K/200K)");
+        expect(text).toContain("By model:");
+        expect(text).toContain("gpt-x 100,000 (2 runs)");
+        expect(text).toContain("By caller: lead 100,000 · subagent 20,000 · middleware 8,410");
+        const sc = res.structuredContent as {
+          total_tokens: number;
+          by_caller: { lead_agent: number };
+          context_usage: { percentage: number | null };
+        };
+        expect(sc.total_tokens).toBe(128410);
+        expect(sc.by_caller.lead_agent).toBe(100000);
+        expect(sc.context_usage.percentage).toBe(62);
       }
     );
   });
@@ -351,7 +419,7 @@ describe("MCP tools", () => {
     await withTools(
       () => ({ status: 401, body: { detail: "Invalid token" } }),
       async (client) => {
-        const res = await client.callTool({ name: "deerflow_list_models", arguments: {} });
+        const res = await client.callTool({ name: "list_models", arguments: {} });
         expect(res.isError).toBe(true);
         const text = textOf(res);
         expect(text).toContain("401");
@@ -370,7 +438,7 @@ describe("MCP tools", () => {
       },
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_research",
+          name: "research",
           arguments: { topic: "AI safety" },
         });
         // The MCP client validates structuredContent against the advertised
@@ -410,7 +478,7 @@ describe("MCP tools", () => {
       },
       async (client) => {
         const res = await client.callTool({
-          name: "deerflow_wait_activity",
+          name: "wait_activity",
           arguments: { thread_id: "t-1", run_id: "r-1", since_seq: 10, timeout_seconds: 5 },
         });
         expect(res.isError).toBeFalsy();

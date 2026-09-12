@@ -56,7 +56,7 @@ For quick non-blocking checks use deerflow_run_status (status + live counters: l
 
 The report and each artifact are also available as MCP resources: deerflow://threads/{thread_id}/report and deerflow://threads/{thread_id}/artifacts/{path}.
 
-For ordinary back-and-forth, use deerflow_chat (pass an existing thread_id to continue a conversation). Use deerflow_list_models to discover model names, deerflow_list_threads to find prior work, deerflow_cancel_run to stop a run, and deerflow_list_artifacts / deerflow_get_artifact to retrieve produced files.`,
+For ordinary back-and-forth, use deerflow_chat (pass an existing thread_id to continue a conversation). Use deerflow_list_models to discover model names, deerflow_list_threads to find prior work, deerflow_cancel_run to stop a run, and deerflow_list_artifacts / deerflow_get_artifact to retrieve produced files. Use deerflow_token_usage on a thread to read its full token-usage breakdown (total/input/output, per-model, per-caller, and context-window fill).`,
 };
 
 function makeServer(client: DeerFlowClient): McpServer {

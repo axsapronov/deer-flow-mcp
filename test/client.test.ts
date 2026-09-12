@@ -374,6 +374,63 @@ describe("DeerFlowClient progress & activity", () => {
     expect(text.summary).toBe("Final answer text");
   });
 
+  it("summarizeRunEvent renders subagent start/step/end events", () => {
+    const start = summarizeRunEvent({
+      seq: 50,
+      event_type: "subagent.start",
+      content: { task_id: "call_1", description: "research vLLM releases" },
+      metadata: { task_id: "call_1" },
+    });
+    expect(start.kind).toBe("other");
+    expect(start.summary).toBe("subagent start: research vLLM releases");
+
+    const toolStep = summarizeRunEvent({
+      seq: 51,
+      event_type: "subagent.step",
+      content: {
+        task_id: "call_1",
+        message_index: 2,
+        kind: "tool",
+        tool_name: "read_file",
+        text: "reading releases.md",
+        truncated: false,
+      },
+      metadata: { task_id: "call_1", message_index: 2 },
+    });
+    expect(toolStep.summary).toBe("subagent[call_1] read_file: reading releases.md");
+
+    const aiStep = summarizeRunEvent({
+      seq: 52,
+      event_type: "subagent.step",
+      content: {
+        task_id: "call_1",
+        message_index: 1,
+        kind: "ai",
+        text: "Let me search the web.",
+        truncated: false,
+        tool_calls: [{ name: "web_search", args: { query: "vLLM" } }],
+      },
+      metadata: { task_id: "call_1", message_index: 1 },
+    });
+    expect(aiStep.summary).toBe("subagent[call_1] ai: Let me search the web.");
+
+    const end = summarizeRunEvent({
+      seq: 53,
+      event_type: "subagent.end",
+      content: { task_id: "call_1", status: "completed", model_name: "claude-3-7" },
+      metadata: { task_id: "call_1" },
+    });
+    expect(end.summary).toBe("subagent[call_1] completed");
+
+    const failed = summarizeRunEvent({
+      seq: 54,
+      event_type: "subagent.end",
+      content: { task_id: "call_2", status: "failed", error: "boom" },
+      metadata: { task_id: "call_2" },
+    });
+    expect(failed.summary).toBe("subagent[call_2] failed — boom");
+  });
+
   it("getProgress composes run counters, activity, and todos", async () => {
     const { fetchFn } = createMockFetch(progressResponder(runRow(), EVENTS));
     const client = new DeerFlowClient(makeConfig(), fetchFn);

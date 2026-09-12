@@ -54,14 +54,28 @@ src/
   index.ts        # Entry point (-> dist/index.js): CLI parsing, transport selection, McpServer bootstrap
   lib/
     config.ts     # Env parsing/validation -> DeerFlowConfig; ConfigError
-    types.ts      # Shared types: RunStatus, ThreadSummary, RunInfo, Report, ModelInfo, DeerFlowAuth, DeerFlowConfig
+    types.ts      # Shared types: RunStatus, RunInfo, RunProgress, Report, TokenUsage, ModelInfo, DeerFlowAuth, DeerFlowConfig
+    client.ts     # DeerFlowClient: Gateway HTTP client (threads, runs, events, progress, artifacts, models, token-usage); SSE join; summarizeRunEvent; composeProgress
+    tools.ts      # MCP tool registration (see tool list below)
+    format.ts     # Human-readable text builders: formatRunStatus, formatProgress, formatTokenUsage
+    resources.ts  # MCP resources: report + artifact URIs
     prompts.ts    # Deep-research prompt assembly (buildResearchPrompt)
 test/             # Vitest tests (mirror the src/ layout)
 ```
 
 > Status: the server is implemented end to end. The entry point (`src/index.ts`) wires the
-> CLI and transport; `src/lib/tools.ts` registers the DeerFlow tools (research, chat,
-> run status/progress/wait-activity, report, threads, artifacts, models) on the `McpServer`.
+> CLI and transport; `src/lib/tools.ts` registers the DeerFlow tools on the `McpServer`:
+> `research`, `chat`, `run_status`, `run_progress`, `wait_activity`, `get_report`,
+> `list_threads`, `cancel_run`, `list_artifacts`, `get_artifact`, `list_models`, and
+> `token_usage`. The `run_progress`/`wait_activity`/`run_status` tools return legible
+> multi-line `content` (built by `format.ts`) plus the full object as `structuredContent`.
+>
+> **Tool naming**: tools are registered with short names (no `deerflow_` prefix). The MCP
+> client prepends the server name `deerflow_`, so clients see `deerflow_research`,
+> `deerflow_wait_activity`, etc. Descriptions, the server `instructions`, and the
+> `next_step`/`hint` strings reference the **client-visible** `deerflow_*` names, so they
+> are correct as-is. Tests call tools by their server-side short name (the in-memory and
+> real MCP clients do not add the prefix).
 
 ## Configuration
 

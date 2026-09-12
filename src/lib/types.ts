@@ -37,6 +37,16 @@ export interface RunInfo {
   updated_at?: string;
   /** Total tokens consumed so far (advances while the run is working). */
   total_tokens?: number;
+  /** Input (prompt) tokens consumed so far. */
+  total_input_tokens?: number;
+  /** Output (completion) tokens consumed so far. */
+  total_output_tokens?: number;
+  /** Tokens attributed to the lead agent. */
+  lead_agent_tokens?: number;
+  /** Tokens attributed to subagents. */
+  subagent_tokens?: number;
+  /** Tokens attributed to middleware. */
+  middleware_tokens?: number;
   /** Number of LLM calls made so far (advances while the run is working). */
   llm_call_count?: number;
   /** Number of persisted messages so far (advances while the run is working). */
@@ -80,6 +90,11 @@ export interface RunProgress {
   /** Seconds since the run row was last updated (progress-snapshot heartbeat). */
   seconds_since_update?: number;
   total_tokens?: number;
+  total_input_tokens?: number;
+  total_output_tokens?: number;
+  lead_agent_tokens?: number;
+  subagent_tokens?: number;
+  middleware_tokens?: number;
   llm_call_count?: number;
   message_count?: number;
   /** Highest event seq observed (pass back as `since_seq` to get only new events). */
@@ -143,6 +158,41 @@ export interface Report {
   report_source?: ReportSource;
   /** Note explaining an auto-inlined artifact report (present when report_source === "artifact"). */
   artifact_note?: string;
+}
+
+/** Per-model token breakdown for a thread (from `/api/threads/{id}/token-usage`). */
+export interface TokenUsageByModel {
+  tokens: number;
+  runs: number;
+}
+
+/** Per-caller token breakdown for a thread. */
+export interface TokenUsageByCaller {
+  lead_agent: number;
+  subagent: number;
+  middleware: number;
+}
+
+/** Context-window usage for the most recent run of a thread. */
+export interface TokenUsageContext {
+  token_count: number;
+  max_context_tokens: number | null;
+  percentage: number | null;
+}
+
+/**
+ * Aggregate token usage for a thread (from
+ * `GET /api/threads/{id}/token-usage?include_active=true`).
+ */
+export interface TokenUsage {
+  thread_id: string;
+  total_tokens: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_runs: number;
+  by_model: Record<string, TokenUsageByModel>;
+  by_caller: TokenUsageByCaller;
+  context_usage: TokenUsageContext | null;
 }
 
 /** A configured model (from `GET /api/models`). */
