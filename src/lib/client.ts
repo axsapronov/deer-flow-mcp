@@ -23,11 +23,10 @@ export type FetchLike = (
     headers?: Record<string, string>;
     body?: string;
     signal?: AbortSignal;
-  },
+  }
 ) => Promise<Response>;
 
-const DEFAULT_FETCH: FetchLike = (url, init) =>
-  undiciFetch(url, init as RequestInit) as Promise<Response>;
+const DEFAULT_FETCH: FetchLike = (url, init) => undiciFetch(url, init) as Promise<Response>;
 
 /** Error kinds the client can report. All carry a safe, loggable message. */
 export type DeerFlowErrorKind = "http" | "network" | "timeout" | "bad_response";
@@ -91,8 +90,14 @@ export interface SearchThreadsParams {
   metadata?: Record<string, unknown>;
 }
 
-const POLL_INTERVAL_MS = 2000;
+const DEFAULT_POLL_INTERVAL_MS = 2000;
 const MAX_INLINE_ARTIFACT_BYTES = 256 * 1024;
+
+/** Optional client tuning knobs (mainly used to speed up tests). */
+export interface DeerFlowClientOptions {
+  /** Poll interval for `waitForRun`, in milliseconds (default 2000). */
+  pollIntervalMs?: number;
+}
 
 function messageOf(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -103,7 +108,7 @@ function truncate(value: string, max: number): string {
   return value.length > max ? `${value.slice(0, max)}…` : value;
 }
 
-function isTextLikeContentType(contentType: string | null): boolean {
+function isTextLikeContentType(contentType: string | null | undefined): boolean {
   if (!contentType) return false;
   const ct = contentType.toLowerCase();
   return (
@@ -134,10 +139,16 @@ function coerceRunStatus(value: unknown): RunStatus {
 export class DeerFlowClient {
   private readonly config: DeerFlowConfig;
   private readonly fetchFn: FetchLike;
+  private readonly pollIntervalMs: number;
 
-  constructor(config: DeerFlowConfig, fetchFn: FetchLike = DEFAULT_FETCH) {
+  constructor(
+    config: DeerFlowConfig,
+    fetchFn: FetchLike = DEFAULT_FETCH,
+    options: DeerFlowClientOptions = {}
+  ) {
     this.config = config;
     this.fetchFn = fetchFn;
+    this.pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   }
 
   /** Human link to a thread in the DeerFlow web UI. */
@@ -157,7 +168,7 @@ export class DeerFlowClient {
 
   private async requestRaw(
     path: string,
-    init: { method?: string; headers?: Record<string, string>; body?: string } = {},
+    init: { method?: string; headers?: Record<string, string>; body?: string } = {}
   ): Promise<Response> {
     const url = `${this.config.baseUrl}${path}`;
     const headers: Record<string, string> = {
@@ -180,14 +191,14 @@ export class DeerFlowClient {
           `Request to DeerFlow timed out after ${this.config.timeoutMs}ms (${path}).`,
           "timeout",
           undefined,
-          true,
+          true
         );
       }
       throw new DeerFlowError(
         `Network error calling DeerFlow at ${path}: ${truncate(messageOf(err), 300)}`,
         "network",
         undefined,
-        true,
+        true
       );
     } finally {
       clearTimeout(timer);
@@ -214,7 +225,7 @@ export class DeerFlowClient {
 
   private async requestJson<T>(
     path: string,
-    init: { method?: string; headers?: Record<string, string>; body?: string } = {},
+    init: { method?: string; headers?: Record<string, string>; body?: string } = {}
   ): Promise<T> {
     const res = await this.requestRaw(path, init);
     if (!res.ok) {
@@ -223,7 +234,7 @@ export class DeerFlowClient {
         formatHttpError(res.status, detail, path, this.config.auth.kind),
         "http",
         res.status,
-        res.status === 429 || res.status >= 500,
+        res.status === 429 || res.status >= 500
       );
     }
     if (res.status === 204) return undefined as T;
@@ -235,7 +246,7 @@ export class DeerFlowClient {
       throw new DeerFlowError(
         `DeerFlow returned non-JSON data for ${path} (HTTP ${res.status}).`,
         "bad_response",
-        res.status,
+        res.status
       );
     }
   }
@@ -251,7 +262,10 @@ export class DeerFlowClient {
       body: JSON.stringify(body),
     });
     if (!data?.thread_id) {
-      throw new DeerFlowError("DeerFlow did not return a thread_id when creating a thread.", "bad_response");
+      throw new DeerFlowError(
+        "DeerFlow did not return a thread_id when creating a thread.",
+        "bad_response"
+      );
     }
     return { thread_id: data.thread_id };
   }
@@ -273,7 +287,9 @@ export class DeerFlowClient {
   }
 
   async getThreadState(threadId: string): Promise<ThreadState> {
-    const data = await this.requestJson<ThreadState>(`/api/threads/${encodeURIComponent(threadId)}/state`);
+    const data = await this.requestJson<ThreadState>(
+      `/api/threads/${encodeURIComponent(threadId)}/state`
+    );
     return data ?? {};
   }
 
@@ -302,25 +318,21 @@ export class DeerFlowClient {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-      },
+      }
     );
     return normalizeRun(data, threadId);
   }
 
   async getRun(threadId: string, runId: string): Promise<RunInfo> {
     const data = await this.requestJson<RawRunResponse>(
-      `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}`,
+      `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}`
     );
     return normalizeRun(data, threadId);
   }
 
-  async listRunMessages(
-    threadId: string,
-    runId: string,
-    limit = 50,
-  ): Promise<unknown[]> {
+  async listRunMessages(threadId: string, runId: string, limit = 50): Promise<unknown[]> {
     const data = await this.requestJson<{ data?: unknown[] }>(
-      `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/messages?limit=${limit}`,
+      `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/messages?limit=${limit}`
     );
     return Array.isArray(data?.data) ? data.data : [];
   }
@@ -328,7 +340,7 @@ export class DeerFlowClient {
   async cancelRun(threadId: string, runId: string): Promise<void> {
     const res = await this.requestRaw(
       `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/cancel?action=interrupt&wait=false`,
-      { method: "POST" },
+      { method: "POST" }
     );
     // 202 (accepted) and 204 (no content) both mean the cancel was accepted.
     if (!res.ok) {
@@ -337,7 +349,7 @@ export class DeerFlowClient {
         formatHttpError(res.status, detail, "cancel run", this.config.auth.kind),
         "http",
         res.status,
-        res.status === 429 || res.status >= 500,
+        res.status === 429 || res.status >= 500
       );
     }
     await res.body?.cancel().catch(() => {});
@@ -353,7 +365,7 @@ export class DeerFlowClient {
     const deadline = Date.now() + waitSeconds * 1000;
     while (!isTerminalRunStatus(info.status) && Date.now() < deadline) {
       const remaining = deadline - Date.now();
-      const sleep = Math.max(0, Math.min(POLL_INTERVAL_MS, remaining));
+      const sleep = Math.max(0, Math.min(this.pollIntervalMs, remaining));
       if (sleep > 0) await new Promise((resolve) => setTimeout(resolve, sleep));
       info = await this.getRun(threadId, runId);
     }
@@ -376,14 +388,16 @@ export class DeerFlowClient {
 
   async getArtifact(threadId: string, path: string): Promise<ArtifactResult> {
     const encoded = path.split("/").map(encodeURIComponent).join("/");
-    const res = await this.requestRaw(`/api/threads/${encodeURIComponent(threadId)}/artifacts/${encoded}`);
+    const res = await this.requestRaw(
+      `/api/threads/${encodeURIComponent(threadId)}/artifacts/${encoded}`
+    );
     if (!res.ok) {
       const detail = await this.extractDetail(res);
       throw new DeerFlowError(
         formatHttpError(res.status, detail, `artifact ${path}`, this.config.auth.kind),
         "http",
         res.status,
-        res.status === 429 || res.status >= 500,
+        res.status === 429 || res.status >= 500
       );
     }
     const url = `${this.config.baseUrl}/api/threads/${encodeURIComponent(threadId)}/artifacts/${encoded}`;
@@ -400,7 +414,10 @@ export class DeerFlowClient {
   // --- Composite operations ------------------------------------------------
 
   /** Start a deep-research run on a fresh thread. */
-  async research(topic: string, opts: RunOptions & ResearchPromptOptions = {}): Promise<StartedRun> {
+  async research(
+    topic: string,
+    opts: RunOptions & ResearchPromptOptions = {}
+  ): Promise<StartedRun> {
     const prompt = buildResearchPrompt(topic, { focus: opts.focus, model: opts.model });
     const thread = await this.createThread();
     const run = await this.createRun(thread.thread_id, {
@@ -514,10 +531,9 @@ function normalizeRun(raw: RawRunResponse | undefined, threadId: string): RunInf
 
 function normalizeThreadSummary(raw: unknown): ThreadSummary {
   const obj = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
-  const values = (typeof obj.values === "object" && obj.values !== null ? obj.values : {}) as Record<
-    string,
-    unknown
-  >;
+  const values = (
+    typeof obj.values === "object" && obj.values !== null ? obj.values : {}
+  ) as Record<string, unknown>;
   return {
     thread_id: typeof obj.thread_id === "string" ? obj.thread_id : String(obj.thread_id ?? ""),
     status: typeof obj.status === "string" ? obj.status : undefined,
@@ -572,7 +588,7 @@ function formatHttpError(
   status: number,
   detail: string | undefined,
   context: string,
-  authKind: "pat" | "internal",
+  authKind: "pat" | "internal"
 ): string {
   const detailSuffix = detail ? ` ${detail}` : "";
   switch (status) {

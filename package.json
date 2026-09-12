@@ -4,12 +4,28 @@
   "description": "MCP server that drives a deployed DeerFlow instance over its HTTP API: deep research and full thread/run/artifact control.",
   "keywords": [
     "modelcontextprotocol",
+    "model-context-protocol",
     "mcp",
+    "mcp-server",
     "deerflow",
     "deep-research",
-    "agent"
+    "agent",
+    "llm",
+    "claude",
+    "cursor"
   ],
   "license": "MIT",
+  "author": {
+    "name": "axsapronov"
+  },
+  "homepage": "https://github.com/axsapronov/deer-flow-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axsapronov/deer-flow-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/axsapronov/deer-flow-mcp/issues"
+  },
   "type": "module",
   "bin": {
     "deer-flow-mcp": "dist/index.js"
@@ -19,6 +35,9 @@
     "README.md",
     "LICENSE"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc && chmod 755 dist/index.js",
     "typecheck": "tsc --noEmit",
@@ -27,7 +46,8 @@
     "format:check": "prettier --check .",
     "test": "vitest run",
     "dev": "tsc --watch",
-    "start": "node dist/index.js --transport http"
+    "start": "node dist/index.js --transport http",
+    "prepublishOnly": "pnpm run typecheck && pnpm run lint && pnpm run test && pnpm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.0.0",

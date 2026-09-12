@@ -14,7 +14,10 @@ function errorResult(err: unknown): ToolResult {
     err instanceof DeerFlowError
       ? err.message
       : `Unexpected error: ${err instanceof Error ? err.message : String(err)}`;
-  return { content: [{ type: "text" as const, text: `DeerFlow error: ${message}` }], isError: true };
+  return {
+    content: [{ type: "text" as const, text: `DeerFlow error: ${message}` }],
+    isError: true,
+  };
 }
 
 /**
@@ -47,8 +50,13 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
         focus: z
           .string()
           .optional()
-          .describe("Optional one-line constraint to fold into the brief (e.g. 'focus on the EU')."),
-        model: z.string().optional().describe("Optional DeerFlow model name (see deerflow_list_models)."),
+          .describe(
+            "Optional one-line constraint to fold into the brief (e.g. 'focus on the EU')."
+          ),
+        model: z
+          .string()
+          .optional()
+          .describe("Optional DeerFlow model name (see deerflow_list_models)."),
         recursion_limit: z
           .number()
           .int()
@@ -57,7 +65,12 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           .optional()
           .describe("Optional agent recursion budget for this run (default 1000)."),
       }),
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: false,
+      },
     },
     (args) =>
       withTool(async () => {
@@ -67,7 +80,7 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           recursionLimit: args.recursion_limit,
         });
         return textResult(`Deep research started.\n${JSON.stringify(result, null, 2)}`);
-      }),
+      })
   );
 
   server.registerTool(
@@ -91,7 +104,12 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           .optional()
           .describe("Optional agent recursion budget for this run (default 1000)."),
       }),
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: false },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: false,
+      },
     },
     (args) =>
       withTool(async () => {
@@ -101,7 +119,7 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           recursionLimit: args.recursion_limit,
         });
         return textResult(`Chat run started.\n${JSON.stringify(result, null, 2)}`);
-      }),
+      })
   );
 
   server.registerTool(
@@ -121,7 +139,12 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
           .optional()
           .describe("Seconds to poll for a terminal status before returning (0 = check once)."),
       }),
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
     },
     (args) =>
       withTool(async () => {
@@ -136,10 +159,10 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
               terminal: isTerminalRunStatus(run.status),
             },
             null,
-            2,
-          ),
+            2
+          )
         );
-      }),
+      })
   );
 
   server.registerTool(
@@ -150,15 +173,23 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
         "Fetch the synthesized report for a DeerFlow thread: the most recent assistant message, its title, and any produced artifact file paths. Call after a run reaches a terminal status. Optionally pass run_id to scope the report to a specific run.",
       inputSchema: z.object({
         thread_id: z.string().describe("The thread id."),
-        run_id: z.string().optional().describe("Optional run id to scope the report to a specific run."),
+        run_id: z
+          .string()
+          .optional()
+          .describe("Optional run id to scope the report to a specific run."),
       }),
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
     },
     (args) =>
       withTool(async () => {
         const report = await client.getReport(args.thread_id, args.run_id);
         return textResult(formatReport(report));
-      }),
+      })
   );
 
   server.registerTool(
@@ -168,16 +199,33 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
       description:
         "List recent DeerFlow threads (id, title, status, timestamps). Use the returned thread_id with deerflow_chat to continue a conversation or deerflow_get_report to read a finished one.",
       inputSchema: z.object({
-        limit: z.number().int().min(1).max(1000).optional().describe("Maximum threads to return (default 20)."),
-        include_archived: z.boolean().optional().describe("Include archived threads (default false)."),
+        limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(1000)
+          .optional()
+          .describe("Maximum threads to return (default 20)."),
+        include_archived: z
+          .boolean()
+          .optional()
+          .describe("Include archived threads (default false)."),
       }),
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
     },
     (args) =>
       withTool(async () => {
-        const threads = await client.searchThreads({ limit: args.limit ?? 20, archived: args.include_archived });
+        const threads = await client.searchThreads({
+          limit: args.limit ?? 20,
+          archived: args.include_archived,
+        });
         return textResult(JSON.stringify({ threads }, null, 2));
-      }),
+      })
   );
 
   server.registerTool(
@@ -189,14 +237,23 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
         thread_id: z.string().describe("The thread id."),
         run_id: z.string().describe("The run id to cancel."),
       }),
-      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
     },
     (args) =>
       withTool(async () => {
         await client.cancelRun(args.thread_id, args.run_id);
-        const result = { thread_id: args.thread_id, run_id: args.run_id, status: "interrupted" as RunStatus };
+        const result = {
+          thread_id: args.thread_id,
+          run_id: args.run_id,
+          status: "interrupted" as RunStatus,
+        };
         return textResult(JSON.stringify(result, null, 2));
-      }),
+      })
   );
 
   server.registerTool(
@@ -208,13 +265,18 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
       inputSchema: z.object({
         thread_id: z.string().describe("The thread id."),
       }),
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
     },
     (args) =>
       withTool(async () => {
         const artifacts = await client.listArtifacts(args.thread_id);
         return textResult(JSON.stringify({ artifacts }, null, 2));
-      }),
+      })
   );
 
   server.registerTool(
@@ -227,15 +289,22 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
         thread_id: z.string().describe("The thread id."),
         path: z
           .string()
-          .describe("The artifact path, as listed by deerflow_list_artifacts (e.g. 'mnt/user-data/outputs/report.md')."),
+          .describe(
+            "The artifact path, as listed by deerflow_list_artifacts (e.g. 'mnt/user-data/outputs/report.md')."
+          ),
       }),
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
     },
     (args) =>
       withTool(async () => {
         const artifact = await client.getArtifact(args.thread_id, args.path);
         return textResult(formatArtifact(artifact));
-      }),
+      })
   );
 
   server.registerTool(
@@ -245,13 +314,18 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
       description:
         "List the models configured on the DeerFlow instance (name, display name, and capability flags). Use a returned name for the model argument of deerflow_research / deerflow_chat. Note: with a Personal Access Token this endpoint is not in the PAT route allowlist — an internal token is required.",
       inputSchema: z.object({}),
-      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: true, idempotentHint: true },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
     },
     () =>
       withTool(async () => {
         const models = await client.listModels();
         return textResult(JSON.stringify({ models }, null, 2));
-      }),
+      })
   );
 }
 
@@ -262,7 +336,9 @@ function formatReport(report: Report): string {
   if (report.report) {
     lines.push(report.report);
   } else {
-    lines.push("(No assistant message yet — the run may still be in progress or produced no final text.)");
+    lines.push(
+      "(No assistant message yet — the run may still be in progress or produced no final text.)"
+    );
   }
   if (report.artifacts.length > 0) {
     lines.push("");
@@ -276,7 +352,9 @@ function formatReport(report: Report): string {
 
 function formatArtifact(artifact: ArtifactResult): string {
   if (artifact.content !== undefined) {
-    const header = artifact.contentType ? `# ${artifact.path} (${artifact.contentType})` : `# ${artifact.path}`;
+    const header = artifact.contentType
+      ? `# ${artifact.path} (${artifact.contentType})`
+      : `# ${artifact.path}`;
     return `${header}\n\n${artifact.content}`;
   }
   return JSON.stringify(
@@ -287,6 +365,6 @@ function formatArtifact(artifact: ArtifactResult): string {
       note: "Binary artifact — content not inlined. Use the URL with your DeerFlow credential to download it.",
     },
     null,
-    2,
+    2
   );
 }

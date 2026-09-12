@@ -70,8 +70,8 @@ function resolveAuth(env: Env): DeerFlowAuth {
   }
   throw new ConfigError(
     [
-      "No DeerFlow credentials configured. Set DEERFLOW_PAT (Personal Access Token,",",
-      "  recommended for per-user access) or DEERFLOW_INTERNAL_TOKEN (full access to",",
+      "No DeerFlow credentials configured. Set DEERFLOW_PAT (Personal Access Token,",
+      "  recommended for per-user access) or DEERFLOW_INTERNAL_TOKEN (full access to",
       "  models + artifact files). See .env.example for details.",
     ].join(" ")
   );
@@ -104,7 +104,11 @@ export function loadConfig(env: Env = process.env): DeerFlowConfig {
     DEFAULT_RECURSION_LIMIT,
     ENV.defaultRecursionLimit
   );
-  const timeoutMs = parsePositiveInt(readTrimmed(env, ENV.timeoutMs), DEFAULT_TIMEOUT_MS, ENV.timeoutMs);
+  const timeoutMs = parsePositiveInt(
+    readTrimmed(env, ENV.timeoutMs),
+    DEFAULT_TIMEOUT_MS,
+    ENV.timeoutMs
+  );
 
   return {
     baseUrl,

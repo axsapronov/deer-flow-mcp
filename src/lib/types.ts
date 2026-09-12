@@ -3,13 +3,7 @@
  */
 
 /** Lifecycle status of a single DeerFlow run (mirrors backend `RunStatus`). */
-export type RunStatus =
-  | "pending"
-  | "running"
-  | "success"
-  | "error"
-  | "timeout"
-  | "interrupted";
+export type RunStatus = "pending" | "running" | "success" | "error" | "timeout" | "interrupted";
 
 /** Run statuses that mean the run has stopped and will not change again. */
 export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
@@ -68,8 +62,7 @@ export interface ModelInfo {
 
 /** How the server authenticates to DeerFlow. */
 export type DeerFlowAuth =
-  | { kind: "pat"; token: string }
-  | { kind: "internal"; token: string; ownerUserId?: string };
+  { kind: "pat"; token: string } | { kind: "internal"; token: string; ownerUserId?: string };
 
 /** Fully-resolved server configuration. */
 export interface DeerFlowConfig {
