@@ -16,6 +16,35 @@ describe("loadConfig", () => {
     );
   });
 
+  it("parses email/password auth (session mode)", () => {
+    const cfg = loadConfig({
+      DEERFLOW_BASE_URL: "https://x.example",
+      DEERFLOW_EMAIL: "user@example.com",
+      DEERFLOW_PASSWORD: "s3cret",
+    });
+    expect(cfg.auth).toEqual({ kind: "session", email: "user@example.com", password: "s3cret" });
+  });
+
+  it("requires DEERFLOW_EMAIL and DEERFLOW_PASSWORD to be set together", () => {
+    expect(() =>
+      loadConfig({ DEERFLOW_BASE_URL: "https://x.example", DEERFLOW_EMAIL: "user@example.com" })
+    ).toThrow(/DEERFLOW_EMAIL and DEERFLOW_PASSWORD must be set together/);
+    expect(() =>
+      loadConfig({ DEERFLOW_BASE_URL: "https://x.example", DEERFLOW_PASSWORD: "s3cret" })
+    ).toThrow(/DEERFLOW_EMAIL and DEERFLOW_PASSWORD must be set together/);
+  });
+
+  it("prefers email/password over PAT and internal token when all are set", () => {
+    const cfg = loadConfig({
+      DEERFLOW_BASE_URL: "https://x.example",
+      DEERFLOW_EMAIL: "user@example.com",
+      DEERFLOW_PASSWORD: "s3cret",
+      DEERFLOW_PAT: "dfp_x",
+      DEERFLOW_INTERNAL_TOKEN: "tok",
+    });
+    expect(cfg.auth).toEqual({ kind: "session", email: "user@example.com", password: "s3cret" });
+  });
+
   it("parses PAT auth and strips trailing slashes", () => {
     const cfg = loadConfig({ DEERFLOW_BASE_URL: "https://x.example/", DEERFLOW_PAT: "dfp_x" });
     expect(cfg.baseUrl).toBe("https://x.example");

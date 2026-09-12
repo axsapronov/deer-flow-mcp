@@ -126,6 +126,79 @@ describe("DeerFlowClient", () => {
     );
   });
 
+  it("session auth logs in lazily and sends cookie + CSRF on state-changing calls", async () => {
+    const { fetchFn, calls } = createMockFetch((call) => {
+      if (call.url.endsWith("/api/v1/auth/login/local")) {
+        return {
+          setCookies: ["access_token=jwt123; HttpOnly", "csrf_token=c123; SameSite=Lax"],
+          body: {},
+        };
+      }
+      return { body: { thread_id: "t-1" } };
+    });
+    const config = makeConfig({
+      auth: { kind: "session", email: "user@example.com", password: "s3cret" },
+    });
+    const client = new DeerFlowClient(config, fetchFn);
+    await client.createThread();
+    expect(calls[0].method).toBe("POST");
+    expect(calls[0].url).toBe("https://deer.example.com/api/v1/auth/login/local");
+    expect(calls[0].headers["Content-Type"]).toBe("application/x-www-form-urlencoded");
+    expect(calls[0].body).toBe("username=user%40example.com&password=s3cret&remember_me=true");
+    expect(calls[1].headers["Cookie"]).toBe("access_token=jwt123; csrf_token=c123");
+    expect(calls[1].headers["X-CSRF-Token"]).toBe("c123");
+    expect(calls[1].headers["Authorization"]).toBeUndefined();
+    expect(calls.length).toBe(2);
+  });
+
+  it("session auth without a csrf_token cookie sends only the access_token cookie", async () => {
+    const { fetchFn, calls } = createMockFetch((call) => {
+      if (call.url.endsWith("/api/v1/auth/login/local")) {
+        return { setCookies: ["access_token=jwt123; HttpOnly"], body: {} };
+      }
+      return { body: { models: [] } };
+    });
+    const config = makeConfig({ auth: { kind: "session", email: "e", password: "p" } });
+    const client = new DeerFlowClient(config, fetchFn);
+    await client.listModels();
+    expect(calls[1].headers["Cookie"]).toBe("access_token=jwt123");
+    expect(calls[1].headers["X-CSRF-Token"]).toBeUndefined();
+  });
+
+  it("session auth re-logs in once after a 401 and then succeeds", async () => {
+    let logins = 0;
+    let apiCalls = 0;
+    const { fetchFn, calls } = createMockFetch((call) => {
+      if (call.url.endsWith("/api/v1/auth/login/local")) {
+        logins += 1;
+        return { setCookies: [`access_token=jwt${logins}; HttpOnly`], body: {} };
+      }
+      apiCalls += 1;
+      if (apiCalls === 1) return { status: 401, body: { detail: "session expired" } };
+      return { body: { models: [] } };
+    });
+    const config = makeConfig({ auth: { kind: "session", email: "e", password: "p" } });
+    const client = new DeerFlowClient(config, fetchFn);
+    const models = await client.listModels();
+    expect(models).toEqual([]);
+    expect(logins).toBe(2);
+    // login, 401, re-login, retried request
+    expect(calls.length).toBe(4);
+    expect(calls[3].headers["Cookie"]).toBe("access_token=jwt2");
+  });
+
+  it("session auth with bad credentials throws a clear login error", async () => {
+    const { fetchFn } = createMockFetch((call) => {
+      if (call.url.endsWith("/api/v1/auth/login/local")) {
+        return { status: 401, body: { detail: "Invalid credentials" } };
+      }
+      return { body: {} };
+    });
+    const config = makeConfig({ auth: { kind: "session", email: "e", password: "p" } });
+    const client = new DeerFlowClient(config, fetchFn);
+    await expect(client.listModels()).rejects.toThrow(/DEERFLOW_EMAIL and DEERFLOW_PASSWORD/);
+  });
+
   it("uses internal-token headers when configured", async () => {
     const config = makeConfig({ auth: { kind: "internal", token: "tok", ownerUserId: "u-1" } });
     const { fetchFn, calls } = createMockFetch(() => ({ body: { models: [] } }));

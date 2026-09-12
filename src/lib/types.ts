@@ -60,9 +60,16 @@ export interface ModelInfo {
   supports_reasoning_effort?: boolean;
 }
 
-/** How the server authenticates to DeerFlow. */
+/**
+ * How the server authenticates to DeerFlow.
+ *
+ * `session` is email + password: the client logs in like the web UI
+ * (`POST /api/v1/auth/login/local`) and carries the resulting session cookie.
+ */
 export type DeerFlowAuth =
-  { kind: "pat"; token: string } | { kind: "internal"; token: string; ownerUserId?: string };
+  | { kind: "session"; email: string; password: string }
+  | { kind: "pat"; token: string }
+  | { kind: "internal"; token: string; ownerUserId?: string };
 
 /** Fully-resolved server configuration. */
 export interface DeerFlowConfig {

@@ -3,6 +3,8 @@ import type { DeerFlowAuth, DeerFlowConfig } from "./types.js";
 /** Environment variable names the server reads. */
 export const ENV = {
   baseUrl: "DEERFLOW_BASE_URL",
+  email: "DEERFLOW_EMAIL",
+  password: "DEERFLOW_PASSWORD",
   pat: "DEERFLOW_PAT",
   internalToken: "DEERFLOW_INTERNAL_TOKEN",
   ownerUserId: "DEERFLOW_OWNER_USER_ID",
@@ -54,14 +56,21 @@ function requireHttpUrl(value: string, name: string): string {
 }
 
 function resolveAuth(env: Env): DeerFlowAuth {
+  const email = readTrimmed(env, ENV.email);
+  const password = readTrimmed(env, ENV.password);
+  if (email !== undefined || password !== undefined) {
+    if (email === undefined || password === undefined) {
+      throw new ConfigError("DEERFLOW_EMAIL and DEERFLOW_PASSWORD must be set together.");
+    }
+    return { kind: "session", email, password };
+  }
   const pat = readTrimmed(env, ENV.pat);
-  const internalToken = readTrimmed(env, ENV.internalToken);
-  const ownerUserId = readTrimmed(env, ENV.ownerUserId);
-
   if (pat) {
     return { kind: "pat", token: pat };
   }
+  const internalToken = readTrimmed(env, ENV.internalToken);
   if (internalToken) {
+    const ownerUserId = readTrimmed(env, ENV.ownerUserId);
     return {
       kind: "internal",
       token: internalToken,
@@ -70,9 +79,10 @@ function resolveAuth(env: Env): DeerFlowAuth {
   }
   throw new ConfigError(
     [
-      "No DeerFlow credentials configured. Set DEERFLOW_PAT (Personal Access Token,",
-      "  recommended for per-user access) or DEERFLOW_INTERNAL_TOKEN (full access to",
-      "  models + artifact files). See .env.example for details.",
+      "No DeerFlow credentials configured. Set DEERFLOW_EMAIL + DEERFLOW_PASSWORD (email/password,",
+      "  simplest — full user access, tried first), DEERFLOW_PAT (Personal Access Token,",
+      "  threads/runs only) or DEERFLOW_INTERNAL_TOKEN (full access to models + artifact files).",
+      "  See .env.example for details.",
     ].join(" ")
   );
 }

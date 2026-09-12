@@ -129,17 +129,47 @@ function coerceRunStatus(value: unknown): RunStatus {
 }
 
 /**
+ * Parse all `Set-Cookie` headers of a response into a name → value map.
+ * Uses `Headers.getSetCookie()` (multiple cookies survive); falls back to the
+ * single-value `get("set-cookie")` on older runtimes.
+ */
+function readSetCookies(res: Response): Map<string, string> {
+  const map = new Map<string, string>();
+  const raw =
+    typeof res.headers.getSetCookie === "function"
+      ? res.headers.getSetCookie()
+      : res.headers.get("set-cookie")
+        ? [res.headers.get("set-cookie") as string]
+        : [];
+  for (const entry of raw) {
+    const eq = entry.indexOf("=");
+    if (eq <= 0) continue;
+    const name = entry.slice(0, eq).trim();
+    const value =
+      entry
+        .slice(eq + 1)
+        .split(";")[0]
+        ?.trim() ?? "";
+    map.set(name, value);
+  }
+  return map;
+}
+
+/**
  * Thin, dependency-light client for the DeerFlow Gateway HTTP API.
  *
  * It targets the native `/api/...` routes (the same handlers nginx exposes as
- * `/api/langgraph/...`). Authentication is fixed at construction: either a
- * Personal Access Token (`Authorization: Bearer dfp_…`) or the internal token
+ * `/api/langgraph/...`). Authentication is fixed at construction: a session
+ * (email/password, logged in lazily and carried as cookies), a Personal Access
+ * Token (`Authorization: Bearer dfp_…`), or the internal token
  * (`X-DeerFlow-Internal-Token` [+ owner user id]).
  */
 export class DeerFlowClient {
   private readonly config: DeerFlowConfig;
   private readonly fetchFn: FetchLike;
   private readonly pollIntervalMs: number;
+  /** Cached login result for session auth; `undefined` until the first login. */
+  private session?: { accessToken: string; csrfToken?: string };
 
   constructor(
     config: DeerFlowConfig,
@@ -156,10 +186,100 @@ export class DeerFlowClient {
     return `${this.config.webBaseUrl}/workspace/chats/${threadId}`;
   }
 
+  /**
+   * Log in with email/password like the web UI does
+   * (`POST /api/v1/auth/login/local`, form-encoded). The resulting JWT lives
+   * only in the `access_token` cookie (plus the double-submit `csrf_token`
+   * cookie); neither is returned in the body.
+   */
+  private async login(): Promise<void> {
+    const auth = this.config.auth;
+    if (auth.kind !== "session") return;
+    const url = `${this.config.baseUrl}/api/v1/auth/login/local`;
+    const body = `username=${encodeURIComponent(auth.email)}&password=${encodeURIComponent(
+      auth.password
+    )}&remember_me=true`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
+    let res: Response;
+    try {
+      res = await this.fetchFn(url, {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body,
+        signal: controller.signal,
+      });
+    } catch (err) {
+      if (controller.signal.aborted) {
+        throw new DeerFlowError(
+          `Login to DeerFlow timed out after ${this.config.timeoutMs}ms.`,
+          "timeout",
+          undefined,
+          true
+        );
+      }
+      throw new DeerFlowError(
+        `Network error logging in to DeerFlow: ${truncate(messageOf(err), 300)}`,
+        "network",
+        undefined,
+        true
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!res.ok) {
+      const detail = await this.extractDetail(res);
+      throw new DeerFlowError(
+        [
+          `DeerFlow login failed (HTTP ${res.status}). Check DEERFLOW_EMAIL and DEERFLOW_PASSWORD.`,
+          detail,
+        ]
+          .filter(Boolean)
+          .join(" "),
+        "http",
+        res.status
+      );
+    }
+    const cookies = readSetCookies(res);
+    const accessToken = cookies.get("access_token");
+    if (!accessToken) {
+      throw new DeerFlowError(
+        "DeerFlow login succeeded but did not set the access_token cookie.",
+        "bad_response",
+        res.status
+      );
+    }
+    const csrfToken = cookies.get("csrf_token");
+    this.session = {
+      accessToken,
+      ...(csrfToken ? { csrfToken } : {}),
+    };
+  }
+
+  /** Log in on first use (lazy) so startup stays credential-free. */
+  private async ensureSession(): Promise<void> {
+    if (this.session) return;
+    await this.login();
+  }
+
   private authHeaders(): Record<string, string> {
     const auth = this.config.auth;
     if (auth.kind === "pat") {
       return { Authorization: `Bearer ${auth.token}` };
+    }
+    if (auth.kind === "session") {
+      const s = this.session;
+      if (!s) return {};
+      const headers: Record<string, string> = {
+        Cookie: s.csrfToken
+          ? `access_token=${s.accessToken}; csrf_token=${s.csrfToken}`
+          : `access_token=${s.accessToken}`,
+      };
+      if (s.csrfToken) headers["X-CSRF-Token"] = s.csrfToken;
+      return headers;
     }
     const headers: Record<string, string> = { "X-DeerFlow-Internal-Token": auth.token };
     if (auth.ownerUserId) headers["X-DeerFlow-Owner-User-Id"] = auth.ownerUserId;
@@ -168,8 +288,11 @@ export class DeerFlowClient {
 
   private async requestRaw(
     path: string,
-    init: { method?: string; headers?: Record<string, string>; body?: string } = {}
+    init: { method?: string; headers?: Record<string, string>; body?: string } = {},
+    retryOn401 = true
   ): Promise<Response> {
+    const auth = this.config.auth;
+    if (auth.kind === "session") await this.ensureSession();
     const url = `${this.config.baseUrl}${path}`;
     const headers: Record<string, string> = {
       Accept: "application/json",
@@ -179,12 +302,21 @@ export class DeerFlowClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.config.timeoutMs);
     try {
-      return await this.fetchFn(url, {
+      const res = await this.fetchFn(url, {
         method: init.method ?? "GET",
         headers,
         body: init.body,
         signal: controller.signal,
       });
+      if (auth.kind === "session" && res.status === 401 && retryOn401) {
+        // The session was rejected (expired/invalidated): re-login once and
+        // retry. The retry passes retryOn401=false so a second 401 surfaces
+        // as an error instead of looping.
+        this.session = undefined;
+        await this.login();
+        return await this.requestRaw(path, init, false);
+      }
+      return res;
     } catch (err) {
       if (controller.signal.aborted) {
         throw new DeerFlowError(
@@ -588,7 +720,7 @@ function formatHttpError(
   status: number,
   detail: string | undefined,
   context: string,
-  authKind: "pat" | "internal"
+  authKind: "session" | "pat" | "internal"
 ): string {
   const detailSuffix = detail ? ` ${detail}` : "";
   switch (status) {
@@ -596,13 +728,17 @@ function formatHttpError(
       return `DeerFlow rejected the credential (401).${
         authKind === "pat"
           ? " Personal Access Tokens require a database-backed deployment; memory-only instances reject Bearer tokens."
-          : ""
+          : authKind === "session"
+            ? " The email/password credentials were rejected or the session expired — check DEERFLOW_EMAIL and DEERFLOW_PASSWORD."
+            : ""
       } ${detailSuffix}`.trim();
     case 403:
       return `DeerFlow denied this operation (403).${
         authKind === "pat"
           ? " With a Personal Access Token, /api/models and artifact downloads are not in the PAT route allowlist — use an internal token for those."
-          : ""
+          : authKind === "session"
+            ? " The session is not authorized for this operation."
+            : ""
       } ${detailSuffix}`.trim();
     case 404:
       return `Not found (404): the referenced thread/run/artifact does not exist or you lack access. ${context}.${detailSuffix}`.trim();

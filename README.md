@@ -17,7 +17,8 @@ Each MCP tool maps to one or more DeerFlow HTTP routes and returns the result as
 
 - **Deep research** — kick off a DeerFlow "super agent" run on a topic and get back a structured,
   cited report saved as an artifact.
-- **Model listing** — list the models available to DeerFlow (internal-token mode only).
+- **Model listing** — list the models available to DeerFlow (email/password or internal-token
+  mode).
 - **Thread / run / artifact control** — create threads, start and inspect runs, track status, and
   retrieve artifacts and reports.
 
@@ -45,33 +46,115 @@ own `env` / `environment` field (see [Install in an MCP client](#install-in-an-m
 The server **fails fast** with a descriptive error at startup if required values are missing, so
 the MCP client gets a clean error instead of a cryptic first-request failure.
 
-| Variable                           | Required   | Description                                                             |
-| ---------------------------------- | ---------- | ----------------------------------------------------------------------- |
-| `DEERFLOW_BASE_URL`                | yes        | Base URL of the deployed DeerFlow instance (trailing slashes ignored)   |
-| `DEERFLOW_PAT`                     | one of two | Personal Access Token (starts with `dfp_`); threads/runs routes only    |
-| `DEERFLOW_INTERNAL_TOKEN`          | one of two | Gateway internal token; full access (models + artifact files)           |
-| `DEERFLOW_OWNER_USER_ID`           | no         | Used only with internal-token mode                                      |
-| `DEERFLOW_DEFAULT_MODEL`           | no         | Default model when a tool call omits `model`                            |
-| `DEERFLOW_DEFAULT_RECURSION_LIMIT` | no         | Default LangGraph recursion limit (default `1000`)                      |
-| `DEERFLOW_TIMEOUT_MS`              | no         | Per-request HTTP timeout in ms (default `60000`)                        |
-| `DEERFLOW_WEB_BASE_URL`            | no         | Base URL for "open in DeerFlow" links (defaults to `DEERFLOW_BASE_URL`) |
+| Variable                           | Required     | Description                                                                  |
+| ---------------------------------- | ------------ | ---------------------------------------------------------------------------- |
+| `DEERFLOW_BASE_URL`                | yes          | Base URL of the deployed DeerFlow instance (trailing slashes ignored)        |
+| `DEERFLOW_EMAIL`                   | one of three | Account email; used with `DEERFLOW_PASSWORD` (tried first; full user access) |
+| `DEERFLOW_PASSWORD`                | one of three | Account password; used with `DEERFLOW_EMAIL` (tried first; full user access) |
+| `DEERFLOW_PAT`                     | one of three | Personal Access Token (starts with `dfp_`); threads/runs routes only         |
+| `DEERFLOW_INTERNAL_TOKEN`          | one of three | Gateway internal token; full access (models + artifact files)                |
+| `DEERFLOW_OWNER_USER_ID`           | no           | Used only with internal-token mode                                           |
+| `DEERFLOW_DEFAULT_MODEL`           | no           | Default model when a tool call omits `model`                                 |
+| `DEERFLOW_DEFAULT_RECURSION_LIMIT` | no           | Default LangGraph recursion limit (default `1000`)                           |
+| `DEERFLOW_TIMEOUT_MS`              | no           | Per-request HTTP timeout in ms (default `60000`)                             |
+| `DEERFLOW_WEB_BASE_URL`            | no           | Base URL for "open in DeerFlow" links (defaults to `DEERFLOW_BASE_URL`)      |
 
 ### Authentication
 
-Auth is a discriminated union: either `pat` or `internal`.
+`deer-flow-mcp` authenticates to DeerFlow one of three ways — a discriminated union, so set
+**exactly one** of the credential modes (email/password is tried first, then PAT, then internal
+token):
 
-- **PAT** (`DEERFLOW_PAT`) — restricted to the threads/runs routes. `deerflow_list_models` and
-  `deerflow_get_artifact` return 403 for PAT callers.
-- **Internal token** (`DEERFLOW_INTERNAL_TOKEN`) — full access, including models and artifact
-  files. Set `DEER_FLOW_INTERNAL_AUTH_TOKEN` on the DeerFlow Gateway to the same shared secret,
-  then put that value here.
+- **Email/password** (`DEERFLOW_EMAIL` + `DEERFLOW_PASSWORD`) — logs in like the web UI
+  (`POST /api/v1/auth/login/local`) and carries the resulting session cookie (plus the
+  CSRF token) on every call. This is the same credential you type into the browser: it works on
+  every deployment (no DB, no internal secret) and grants **full user access**, including models
+  and artifact files. Both variables must be set together; the login happens lazily on first use
+  and is retried once if the session expires.
+- **PAT** (`DEERFLOW_PAT`) — a per-user **Personal Access Token** (`dfp_…`), sent as
+  `Authorization: Bearer dfp_…`. Restricted to the thread/run lifecycle routes;
+  `deerflow_list_models` and `deerflow_get_artifact` return 403 for PAT callers.
+- **Internal token** (`DEERFLOW_INTERNAL_TOKEN`) — the deployment-level
+  `DEER_FLOW_INTERNAL_AUTH_TOKEN` shared secret, sent as `X-DeerFlow-Internal-Token` (optionally
+  with `X-DeerFlow-Owner-User-Id`). Full access, including models and artifact files.
+
+All three target the same entry point: the nginx reverse proxy, default `http://<host>:2026`
+(the port is configurable via the `PORT` env var). That is the URL you put in
+`DEERFLOW_BASE_URL`.
+
+#### Getting a Personal Access Token (`DEERFLOW_PAT`)
+
+A PAT is a per-user credential created from the Gateway API while you are logged in. There is
+no dedicated page for it in the web UI, and it requires a **database-backed** deployment (SQLite
+or PostgreSQL) — a memory-only instance rejects Bearer tokens and the PAT routes return `503`.
+
+1. **Sign in to the web UI.** Open your DeerFlow instance.
+   - First boot: open `/setup` and create the first admin account (email + password).
+   - Afterwards: open `/login` and sign in with your email and password (or your SSO provider).
+     A successful login sets the `access_token` session cookie.
+2. **Create the token from the API.** Copy your `access_token` cookie value (browser DevTools →
+   **Application → Cookies**, or the `Cookie` header of any request in **Network**), then:
+
+   ```bash
+   curl -s -X POST "$DEERFLOW_BASE_URL/api/v1/auth/pats" \
+     -H "Content-Type: application/json" \
+     -H "Cookie: access_token=<ACCESS_TOKEN>" \
+     -d '{
+           "name": "deer-flow-mcp",
+           "scopes": ["threads:read", "threads:write", "runs:create", "runs:read", "runs:cancel"],
+           "expires_in_days": 365
+         }'
+   ```
+
+   The `token` field in the response is your `dfp_…` value. It is **shown exactly once** and
+   cannot be retrieved again — only its SHA-256 digest is stored. Save it immediately.
+
+3. **Use it.** Put that value in `DEERFLOW_PAT`.
+
+The scopes above cover every `deer-flow-mcp` tool except `deerflow_list_models` and
+`deerflow_get_artifact` (both 403 for PAT callers — use email/password or an internal token if
+you need them).
+You can list your tokens with `GET /api/v1/auth/pats` and revoke one with
+`DELETE /api/v1/auth/pats/{pat_id}`; revocation is immediate.
+
+#### Getting the internal token (`DEERFLOW_INTERNAL_TOKEN`)
+
+The internal token is a **deployment-level secret** set on the Gateway — it is not tied to any
+user and is not created from the web UI. Its value is the Gateway's `DEER_FLOW_INTERNAL_AUTH_TOKEN`
+environment variable.
+
+- **Docker** (`make up` / the bundled deploy script) — the token is generated automatically and
+  persisted to `$DEER_FLOW_HOME/.internal-auth-token` (mode `600`). `DEER_FLOW_HOME` defaults to
+  `<repo>/backend/.deer-flow` on the host (mounted into the container at
+  `/app/backend/.deer-flow`), so read it with:
+
+  ```bash
+  cat backend/.deer-flow/.internal-auth-token
+  # or from the running gateway container:
+  docker compose exec gateway printenv DEER_FLOW_INTERNAL_AUTH_TOKEN
+  ```
+
+- **Helm / Kubernetes** — it is stored in the chart's app Secret under the key
+  `DEER_FLOW_INTERNAL_AUTH_TOKEN` (the Secret name is printed in the install NOTES):
+
+  ```bash
+  kubectl -n <namespace> get secret <app-secret> \
+    -o jsonpath='{.data.DEER_FLOW_INTERNAL_AUTH_TOKEN}' | base64 -d
+  ```
+
+- **Manual** — set `DEER_FLOW_INTERNAL_AUTH_TOKEN` to a long random secret in your `.env` and
+  restart the stack, then use that same value here.
+
+Put the value in `DEERFLOW_INTERNAL_TOKEN`. To isolate runs under a specific owner, also set
+`DEERFLOW_OWNER_USER_ID` (sent as `X-DeerFlow-Owner-User-Id`).
 
 ## Install in an MCP client
 
 `deer-flow-mcp` is a local **stdio** server started with `npx -y deer-flow-mcp`. In every client
 config below the server is launched via `npx`, and you must pass at least `DEERFLOW_BASE_URL` and
-one credential (`DEERFLOW_PAT` or `DEERFLOW_INTERNAL_TOKEN`) through the `env` / `environment`
-field. For remote/shared access over Streamable HTTP instead, see [Usage](#usage).
+one credential (`DEERFLOW_EMAIL` + `DEERFLOW_PASSWORD`, `DEERFLOW_PAT`, or
+`DEERFLOW_INTERNAL_TOKEN`) through the `env` / `environment` field. For remote/shared access over
+Streamable HTTP instead, see [Usage](#usage).
 
 ### Kilo
 
@@ -86,7 +169,8 @@ for a single project, or the global `~/.config/kilo/kilo.json` for all projects.
       "command": ["npx", "-y", "deer-flow-mcp"],
       "environment": {
         "DEERFLOW_BASE_URL": "https://deerflow.example.com",
-        "DEERFLOW_PAT": "dfp_..."
+        "DEERFLOW_EMAIL": "you@example.com",
+        "DEERFLOW_PASSWORD": "..."
       },
       "enabled": true
     }
@@ -98,8 +182,10 @@ Notes:
 
 - `command` is an **array**; the first element is the executable (`npx`), the rest are its args.
 - Environment variables go in the `environment` object (`KEY: value`).
-- For full access (models + artifact files), replace `DEERFLOW_PAT` with
-  `DEERFLOW_INTERNAL_TOKEN` (and optionally `DEERFLOW_OWNER_USER_ID`).
+- Email/password is the simplest full-access option and is tried first. As
+  alternatives: `DEERFLOW_PAT` (threads/runs routes only) or
+  `DEERFLOW_INTERNAL_TOKEN` (deployment-level full access, optionally with
+  `DEERFLOW_OWNER_USER_ID`).
 - Restart Kilo (or reload MCP servers) to pick up the change.
 
 <details>
@@ -110,7 +196,8 @@ Add it with the CLI (user scope, so it is available across projects):
 ```bash
 claude mcp add --scope user \
   --env DEERFLOW_BASE_URL=https://deerflow.example.com \
-  --env DEERFLOW_PAT=dfp_... \
+  --env DEERFLOW_EMAIL=you@example.com \
+  --env DEERFLOW_PASSWORD=... \
   --transport stdio \
   deerflow -- npx -y deer-flow-mcp
 ```
@@ -126,7 +213,8 @@ in `~/.claude.json` (user scope):
       "args": ["-y", "deer-flow-mcp"],
       "env": {
         "DEERFLOW_BASE_URL": "https://deerflow.example.com",
-        "DEERFLOW_PAT": "dfp_..."
+        "DEERFLOW_EMAIL": "you@example.com",
+        "DEERFLOW_PASSWORD": "..."
       }
     }
   }
@@ -150,7 +238,8 @@ Add a `deerflow` entry under `mcpServers` in `~/.cursor/mcp.json` (global) or `.
       "args": ["-y", "deer-flow-mcp"],
       "env": {
         "DEERFLOW_BASE_URL": "https://deerflow.example.com",
-        "DEERFLOW_PAT": "dfp_..."
+        "DEERFLOW_EMAIL": "you@example.com",
+        "DEERFLOW_PASSWORD": "..."
       }
     }
   }
@@ -174,7 +263,8 @@ Add a `deerflow` entry under `servers` in `.vscode/mcp.json` (per project) or in
       "args": ["-y", "deer-flow-mcp"],
       "env": {
         "DEERFLOW_BASE_URL": "https://deerflow.example.com",
-        "DEERFLOW_PAT": "dfp_..."
+        "DEERFLOW_EMAIL": "you@example.com",
+        "DEERFLOW_PASSWORD": "..."
       }
     }
   }
@@ -196,7 +286,8 @@ args = ["-y", "deer-flow-mcp"]
 
 [mcp_servers.deerflow.env]
 DEERFLOW_BASE_URL = "https://deerflow.example.com"
-DEERFLOW_PAT = "dfp_..."
+DEERFLOW_EMAIL = "you@example.com"
+DEERFLOW_PASSWORD = "..."
 ```
 
 Or add it with the CLI:
@@ -204,7 +295,8 @@ Or add it with the CLI:
 ```bash
 codex mcp add deerflow \
   --env DEERFLOW_BASE_URL=https://deerflow.example.com \
-  --env DEERFLOW_PAT=dfp_... \
+  --env DEERFLOW_EMAIL=you@example.com \
+  --env DEERFLOW_PASSWORD=... \
   -- npx -y deer-flow-mcp
 ```
 
@@ -224,7 +316,8 @@ Add a `deerflow` entry under `mcpServers` in `~/.gemini/settings.json`:
       "args": ["-y", "deer-flow-mcp"],
       "env": {
         "DEERFLOW_BASE_URL": "https://deerflow.example.com",
-        "DEERFLOW_PAT": "dfp_..."
+        "DEERFLOW_EMAIL": "you@example.com",
+        "DEERFLOW_PASSWORD": "..."
       }
     }
   }
@@ -246,7 +339,8 @@ Add a `deerflow` entry under `context_servers` in your Zed `settings.json`:
       "args": ["-y", "deer-flow-mcp"],
       "env": {
         "DEERFLOW_BASE_URL": "https://deerflow.example.com",
-        "DEERFLOW_PAT": "dfp_..."
+        "DEERFLOW_EMAIL": "you@example.com",
+        "DEERFLOW_PASSWORD": "..."
       }
     }
   }
@@ -269,7 +363,8 @@ Add a `deerflow` entry under `mcpServers` in `.cline/mcp_settings.json` (or add 
       "args": ["-y", "deer-flow-mcp"],
       "env": {
         "DEERFLOW_BASE_URL": "https://deerflow.example.com",
-        "DEERFLOW_PAT": "dfp_..."
+        "DEERFLOW_EMAIL": "you@example.com",
+        "DEERFLOW_PASSWORD": "..."
       },
       "disabled": false,
       "autoApprove": []
@@ -293,7 +388,8 @@ Add a `deerflow` entry under `mcpServers` in your Roo Code MCP configuration:
       "args": ["-y", "deer-flow-mcp"],
       "env": {
         "DEERFLOW_BASE_URL": "https://deerflow.example.com",
-        "DEERFLOW_PAT": "dfp_..."
+        "DEERFLOW_EMAIL": "you@example.com",
+        "DEERFLOW_PASSWORD": "..."
       }
     }
   }
@@ -315,7 +411,8 @@ Add a `deerflow` entry under `mcpServers` in your `claude_desktop_config.json`:
       "args": ["-y", "deer-flow-mcp"],
       "env": {
         "DEERFLOW_BASE_URL": "https://deerflow.example.com",
-        "DEERFLOW_PAT": "dfp_..."
+        "DEERFLOW_EMAIL": "you@example.com",
+        "DEERFLOW_PASSWORD": "..."
       }
     }
   }
@@ -337,7 +434,7 @@ Restart Claude Desktop after saving.
 | `deerflow_cancel_run`     | Cancel (interrupt) an in-flight run. Args: `thread_id`, `run_id`.                                                                                           |
 | `deerflow_list_artifacts` | List artifact file paths produced by a thread. Args: `thread_id`.                                                                                           |
 | `deerflow_get_artifact`   | Fetch one artifact (inline text, or a URL for binary files). Args: `thread_id`, `path`.                                                                     |
-| `deerflow_list_models`    | List configured models (name, display name, capability flags). No args. Internal-token only.                                                                |
+| `deerflow_list_models`    | List configured models (name, display name, capability flags). No args. Not available with a PAT (email/password or internal token required).               |
 
 The server also advertises MCP `instructions` that walk a client through the typical deep-research
 flow: `deerflow_research` → poll `deerflow_run_status` → `deerflow_get_report` → `deerflow_get_artifact`.

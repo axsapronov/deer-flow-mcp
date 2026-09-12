@@ -21,6 +21,8 @@ export interface MockResponse {
   /** Raw body text (overrides `body`). */
   text?: string;
   headers?: Record<string, string>;
+  /** Raw `Set-Cookie` header lines (e.g. `"access_token=jwt; HttpOnly"`). */
+  setCookies?: string[];
 }
 
 /** A recorded outgoing request. */
@@ -55,10 +57,14 @@ export function createMockFetch(responder: (call: MockCall) => MockResponse): {
     calls.push(call);
     const resp = responder(call) ?? {};
     const status = resp.status ?? 200;
-    const outHeaders: Record<string, string> = {
-      "content-type": "application/json",
-      ...(resp.headers ?? {}),
-    };
+    // Build the Response from an array of [name, value] pairs so that
+    // multiple `Set-Cookie` values survive (a plain object dedupes them).
+    // Regular headers still go through an object so later keys override the
+    // defaults (the array form would append duplicate names instead).
+    const outHeaders: [string, string][] = [
+      ...Object.entries({ "content-type": "application/json", ...(resp.headers ?? {}) }),
+      ...(resp.setCookies ?? []).map((value) => ["set-cookie", value] as [string, string]),
+    ];
     const text = resp.text !== undefined ? resp.text : JSON.stringify(resp.body ?? {});
     return new Response(text, { status, headers: outHeaders });
   };
