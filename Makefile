@@ -2,7 +2,7 @@ BASEDIR := $(CURDIR)
 SHELL := /bin/bash
 PNPM ?= pnpm
 
-.PHONY: help install build typecheck lint format format-check test check dev start clean version publish release
+.PHONY: help install build typecheck lint format format-check test check dev start clean version commit-release publish release
 
 help: ## Show available targets
 	@echo "Usage: make <target>"
@@ -44,7 +44,11 @@ clean: ## Remove build output
 version: ## Bump the patch version (no git tag)
 	$(PNPM) version patch --no-git-tag-version
 
+commit-release: ## Commit the version bump (package.json + pnpm-lock.yaml)
+	@git add package.json pnpm-lock.yaml
+	@if git diff --cached --quiet -- package.json pnpm-lock.yaml; then echo "No version changes to commit."; else VERSION=$$(node -p "require('./package.json').version") && git commit -m "chore(release): $$VERSION" -- package.json pnpm-lock.yaml; fi
+
 publish: build ## Publish the npm package
 	$(PNPM) publish
 
-release: check version publish ## Verify, bump version and publish
+release: check version commit-release publish ## Verify, bump version, commit and publish
