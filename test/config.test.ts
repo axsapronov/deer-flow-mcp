@@ -125,4 +125,34 @@ describe("loadConfig", () => {
       })
     ).toThrow(ConfigError);
   });
+
+  it("defaults the quiet threshold, progress tick, and poll interval", () => {
+    const cfg = loadConfig({ DEERFLOW_BASE_URL: "https://x.example", DEERFLOW_PAT: "dfp_x" });
+    expect(cfg.quietThresholdSeconds).toBe(60);
+    expect(cfg.progressTickMs).toBe(10_000);
+    expect(cfg.pollIntervalMs).toBe(2_000);
+  });
+
+  it("honors quiet threshold, progress tick, and poll interval overrides", () => {
+    const cfg = loadConfig({
+      DEERFLOW_BASE_URL: "https://x.example",
+      DEERFLOW_PAT: "dfp_x",
+      DEERFLOW_QUIET_THRESHOLD_SECONDS: "120",
+      DEERFLOW_PROGRESS_TICK_MS: "5000",
+      DEERFLOW_POLL_INTERVAL_MS: "500",
+    });
+    expect(cfg.quietThresholdSeconds).toBe(120);
+    expect(cfg.progressTickMs).toBe(5000);
+    expect(cfg.pollIntervalMs).toBe(500);
+  });
+
+  it("rejects a non-positive poll interval", () => {
+    expect(() =>
+      loadConfig({
+        DEERFLOW_BASE_URL: "https://x.example",
+        DEERFLOW_PAT: "dfp_x",
+        DEERFLOW_POLL_INTERVAL_MS: "0",
+      })
+    ).toThrow(ConfigError);
+  });
 });

@@ -13,13 +13,19 @@ export const ENV = {
   timeoutMs: "DEERFLOW_TIMEOUT_MS",
   webBaseUrl: "DEERFLOW_WEB_BASE_URL",
   stallThresholdSeconds: "DEERFLOW_STALL_THRESHOLD_SECONDS",
+  quietThresholdSeconds: "DEERFLOW_QUIET_THRESHOLD_SECONDS",
   progressWaitMaxSeconds: "DEERFLOW_PROGRESS_WAIT_MAX_SECONDS",
+  progressTickMs: "DEERFLOW_PROGRESS_TICK_MS",
+  pollIntervalMs: "DEERFLOW_POLL_INTERVAL_MS",
 } as const;
 
 const DEFAULT_RECURSION_LIMIT = 1000;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_STALL_THRESHOLD_SECONDS = 180;
+const DEFAULT_QUIET_THRESHOLD_SECONDS = 60;
 const DEFAULT_PROGRESS_WAIT_MAX_SECONDS = 120;
+const DEFAULT_PROGRESS_TICK_MS = 10_000;
+const DEFAULT_POLL_INTERVAL_MS = 2_000;
 
 export type Env = Record<string, string | undefined>;
 
@@ -128,10 +134,25 @@ export function loadConfig(env: Env = process.env): DeerFlowConfig {
     DEFAULT_STALL_THRESHOLD_SECONDS,
     ENV.stallThresholdSeconds
   );
+  const quietThresholdSeconds = parsePositiveInt(
+    readTrimmed(env, ENV.quietThresholdSeconds),
+    DEFAULT_QUIET_THRESHOLD_SECONDS,
+    ENV.quietThresholdSeconds
+  );
   const progressWaitMaxSeconds = parsePositiveInt(
     readTrimmed(env, ENV.progressWaitMaxSeconds),
     DEFAULT_PROGRESS_WAIT_MAX_SECONDS,
     ENV.progressWaitMaxSeconds
+  );
+  const progressTickMs = parsePositiveInt(
+    readTrimmed(env, ENV.progressTickMs),
+    DEFAULT_PROGRESS_TICK_MS,
+    ENV.progressTickMs
+  );
+  const pollIntervalMs = parsePositiveInt(
+    readTrimmed(env, ENV.pollIntervalMs),
+    DEFAULT_POLL_INTERVAL_MS,
+    ENV.pollIntervalMs
   );
 
   return {
@@ -142,6 +163,9 @@ export function loadConfig(env: Env = process.env): DeerFlowConfig {
     defaultRecursionLimit,
     timeoutMs,
     stallThresholdSeconds,
+    quietThresholdSeconds,
     progressWaitMaxSeconds,
+    progressTickMs,
+    pollIntervalMs,
   };
 }

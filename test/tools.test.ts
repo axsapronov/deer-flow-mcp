@@ -359,4 +359,77 @@ describe("MCP tools", () => {
       }
     );
   });
+
+  it("returns machine-readable structuredContent that matches the output schema", async () => {
+    await withTools(
+      (call) => {
+        if (call.method === "POST" && call.url.endsWith("/api/threads"))
+          return { body: { thread_id: "t-9" } };
+        if (call.url.endsWith("/runs")) return { body: { run_id: "r-9", status: "pending" } };
+        return { body: {} };
+      },
+      async (client) => {
+        const res = await client.callTool({
+          name: "deerflow_research",
+          arguments: { topic: "AI safety" },
+        });
+        // The MCP client validates structuredContent against the advertised
+        // outputSchema; reaching here without an error proves it is present
+        // and valid. Assert the shape explicitly too.
+        expect(res.isError).toBeFalsy();
+        expect(res.structuredContent).toEqual({
+          thread_id: "t-9",
+          run_id: "r-9",
+          status: "pending",
+          web_url: "https://deer.example.com/workspace/chats/t-9",
+        });
+      }
+    );
+  });
+
+  it("deerflow_wait_activity returns structuredContent with reason and timeout_seconds", async () => {
+    const now = Date.now();
+    const recent = new Date(now - 1_000).toISOString();
+    const started = new Date(now - 40 * 60_000).toISOString();
+    await withTools(
+      (call) => {
+        if (call.url.includes("/runs/r-1/join")) return { status: 404, body: {} };
+        if (call.url.includes("/runs/r-1/events"))
+          return {
+            body: [
+              {
+                seq: 11,
+                event_type: "llm.tool.result",
+                created_at: recent,
+                content: { type: "tool", name: "web_search", content: "done" },
+              },
+            ],
+          };
+        if (call.url.endsWith("/state")) return { body: { values: { todos: [] } } };
+        return { body: { run_id: "r-1", status: "running", created_at: started } };
+      },
+      async (client) => {
+        const res = await client.callTool({
+          name: "deerflow_wait_activity",
+          arguments: { thread_id: "t-1", run_id: "r-1", since_seq: 10, timeout_seconds: 5 },
+        });
+        expect(res.isError).toBeFalsy();
+        const structured = res.structuredContent as {
+          reason: string;
+          timeout_seconds: number;
+          waited_seconds: number;
+          last_event_seq: number;
+        };
+        expect(structured.reason).toBe("activity");
+        expect(structured.timeout_seconds).toBe(5);
+        expect(structured.last_event_seq).toBe(11);
+      }
+    );
+  });
+
+  // Note: `deerflow_wait_activity` also emits MCP progress notifications when the
+  // client supplies a progress token (`params._meta.progressToken`). That path
+  // is exercised by modern-era (2026-07-28+) clients over the HTTP transport;
+  // the in-memory test harness negotiates a legacy era where the token is not
+  // surfaced to the server context, so it is not integration-tested here.
 });

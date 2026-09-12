@@ -1,6 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { DeerFlowClient, DeerFlowError, summarizeRunEvent } from "../src/lib/client.js";
-import { makeConfig, createMockFetch } from "./helpers.js";
+import {
+  DeerFlowClient,
+  DeerFlowError,
+  SseParser,
+  buildWaitResult,
+  summarizeRunEvent,
+  type SseFrame,
+} from "../src/lib/client.js";
+import type { RunProgress } from "../src/lib/types.js";
+import { makeConfig, createMockFetch, sseStream } from "./helpers.js";
 
 describe("DeerFlowClient", () => {
   it("createThread posts to /api/threads with Bearer auth", async () => {
@@ -444,5 +452,321 @@ describe("DeerFlowClient progress & activity", () => {
     expect(res.status).toBe("running");
     expect(res.waited_seconds).toBeGreaterThanOrEqual(1);
     expect(res.activity).toEqual([]);
+  });
+
+  it("getProgress flags a quiet (not stalled) run with a next_step", async () => {
+    // Last activity 90s before NOW: > quietThreshold (60) but < stallThreshold (180).
+    const quietRun = runRow({ updated_at: "2026-09-12T04:08:30.000Z" });
+    const { fetchFn } = createMockFetch(progressResponder(quietRun, []));
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const p = await client.getProgress("t-1", "r-1", { now: NOW });
+    expect(p.seconds_since_activity).toBe(90);
+    expect(p.quiet).toBe(true);
+    expect(p.stalled).toBe(false);
+    expect(p.next_step).toMatch(/Quiet for 90s/);
+  });
+
+  it("getReport auto-inlines the first text artifact when the run ended with no chat text", async () => {
+    const { fetchFn } = createMockFetch((call) => {
+      if (call.url.includes("/runs/r-1/messages")) return { body: { messages: [] } };
+      if (call.url.includes("/runs/r-1")) return { body: { run_id: "r-1", status: "success" } };
+      if (call.url.includes("/artifacts/"))
+        return { text: "# Artifact report\nbody", headers: { "content-type": "text/markdown" } };
+      if (call.url.endsWith("/state"))
+        return {
+          body: { values: { title: "T", artifacts: ["mnt/user-data/outputs/report.md"] } },
+        };
+      return { body: {} };
+    });
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const report = await client.getReport("t-1", "r-1");
+    expect(report.report).toBe("# Artifact report\nbody");
+    expect(report.report_source).toBe("artifact");
+    expect(report.artifact_note).toMatch(/inlined from the artifact/);
+    expect(report.terminal).toBe(true);
+    expect(report.run_status).toBe("success");
+  });
+
+  it("getReport reports run_status and terminal when a run_id is supplied", async () => {
+    const { fetchFn } = createMockFetch((call) => {
+      if (call.url.includes("/runs/r-1/messages")) return { body: { messages: [] } };
+      if (call.url.includes("/runs/r-1")) return { body: { run_id: "r-1", status: "error" } };
+      if (call.url.endsWith("/state")) return { body: { values: { messages: [] } } };
+      return { body: {} };
+    });
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const report = await client.getReport("t-1", "r-1");
+    expect(report.report).toBe("");
+    expect(report.report_source).toBeUndefined();
+    expect(report.terminal).toBe(true);
+    expect(report.run_status).toBe("error");
+  });
+
+  it("waitForActivity joins the SSE stream and returns 'terminal' on the end frame", async () => {
+    const joinStream = sseStream([": heartbeat\n\nevent: end\ndata: null\n\n"]);
+    const { fetchFn } = createMockFetch((call) => {
+      if (call.url.includes("/runs/r-1/join")) return { stream: joinStream };
+      if (call.url.includes("/runs/r-1/events")) return { body: [] };
+      if (call.url.includes("/runs/r-1")) return { body: runRow() };
+      if (call.url.endsWith("/state")) return { body: { values: { todos: [] } } };
+      return { body: {} };
+    });
+    const client = new DeerFlowClient(makeConfig(), fetchFn, { pollIntervalMs: 1 });
+    const res = await client.waitForActivity("t-1", "r-1", { timeoutSeconds: 5 });
+    expect(res.reason).toBe("terminal");
+  });
+
+  it("waitForActivity falls back to polling when the join stream is unavailable", async () => {
+    let joinCalls = 0;
+    const { fetchFn } = createMockFetch((call) => {
+      if (call.url.includes("/runs/r-1/join")) {
+        joinCalls += 1;
+        return { status: 404, body: { detail: "unknown run" } };
+      }
+      if (call.url.includes("/runs/r-1/events")) return { body: [] };
+      if (call.url.includes("/runs/r-1")) return { body: runRow() };
+      if (call.url.endsWith("/state")) return { body: { values: { todos: [] } } };
+      return { body: {} };
+    });
+    const client = new DeerFlowClient(makeConfig(), fetchFn, { pollIntervalMs: 5 });
+    const res = await client.waitForActivity("t-1", "r-1", { timeoutSeconds: 1 });
+    expect(res.reason).toBe("timeout");
+    expect(res.waited_seconds).toBeGreaterThanOrEqual(1);
+    expect(joinCalls).toBe(1);
+  });
+
+  it("waitForActivity emits onTick while polling", async () => {
+    const { fetchFn } = createMockFetch((call) => {
+      if (call.url.includes("/runs/r-1/join")) return { status: 404, body: {} };
+      if (call.url.includes("/runs/r-1/events")) return { body: [] };
+      if (call.url.includes("/runs/r-1")) return { body: runRow() };
+      if (call.url.endsWith("/state")) return { body: { values: { todos: [] } } };
+      return { body: {} };
+    });
+    const client = new DeerFlowClient(makeConfig(), fetchFn, { pollIntervalMs: 10 });
+    const ticks: number[] = [];
+    const res = await client.waitForActivity("t-1", "r-1", {
+      timeoutSeconds: 1,
+      onTick: (elapsed) => ticks.push(elapsed),
+    });
+    expect(res.reason).toBe("timeout");
+    expect(ticks.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("waitForActivity returns stop_reason 'cancelled_by_client' when aborted", async () => {
+    const joinStream = sseStream([": heartbeat\n\n"], { keepOpen: true });
+    const { fetchFn } = createMockFetch((call) => {
+      if (call.url.includes("/runs/r-1/join")) return { stream: joinStream };
+      if (call.url.includes("/runs/r-1/events")) return { body: [] };
+      if (call.url.includes("/runs/r-1")) return { body: runRow() };
+      if (call.url.endsWith("/state")) return { body: { values: { todos: [] } } };
+      return { body: {} };
+    });
+    const client = new DeerFlowClient(makeConfig(), fetchFn, { pollIntervalMs: 10 });
+    const controller = new AbortController();
+    const promise = client.waitForActivity("t-1", "r-1", {
+      timeoutSeconds: 10,
+      signal: controller.signal,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    controller.abort();
+    const res = await promise;
+    expect(res.stop_reason).toBe("cancelled_by_client");
+  });
+});
+
+describe("SseParser", () => {
+  it("parses a single complete frame", () => {
+    const parser = new SseParser();
+    const frames: SseFrame[] = [];
+    parser.feed(
+      "event: end\ndata: null\n\n",
+      (f) => frames.push(f),
+      () => {}
+    );
+    expect(frames).toHaveLength(1);
+    expect(frames[0].event).toBe("end");
+    expect(frames[0].data).toBe("null");
+  });
+
+  it("handles a frame split across chunk boundaries", () => {
+    const parser = new SseParser();
+    const frames: SseFrame[] = [];
+    parser.feed(
+      "event: mes",
+      (f) => frames.push(f),
+      () => {}
+    );
+    parser.feed(
+      "sage\ndata: hel",
+      (f) => frames.push(f),
+      () => {}
+    );
+    parser.feed(
+      "lo\n\n",
+      (f) => frames.push(f),
+      () => {}
+    );
+    expect(frames).toHaveLength(1);
+    expect(frames[0].event).toBe("message");
+    expect(frames[0].data).toBe("hello");
+  });
+
+  it("joins multi-line data with newlines", () => {
+    const parser = new SseParser();
+    const frames: SseFrame[] = [];
+    parser.feed(
+      "data: line1\ndata: line2\n\n",
+      (f) => frames.push(f),
+      () => {}
+    );
+    expect(frames[0].data).toBe("line1\nline2");
+  });
+
+  it("invokes onComment for heartbeat comment lines", () => {
+    const parser = new SseParser();
+    let comments = 0;
+    parser.feed(
+      ": heartbeat\n\n",
+      () => {},
+      () => comments++
+    );
+    expect(comments).toBe(1);
+  });
+
+  it("defaults the event name to 'message' when absent and captures id", () => {
+    const parser = new SseParser();
+    const frames: SseFrame[] = [];
+    parser.feed(
+      "id: 42\ndata: x\n\n",
+      (f) => frames.push(f),
+      () => {}
+    );
+    expect(frames[0].event).toBe("message");
+    expect(frames[0].id).toBe("42");
+  });
+});
+
+describe("joinRunStream", () => {
+  function joinResponder(stream?: ReadableStream<Uint8Array>, status = 200) {
+    return createMockFetch((call) => {
+      if (call.url.includes("/runs/r-1/join"))
+        return stream ? { stream, status } : { status, body: {} };
+      if (call.url.includes("/runs/r-1/events")) return { body: [] };
+      if (call.url.includes("/runs/r-1")) return { body: { run_id: "r-1", status: "running" } };
+      if (call.url.endsWith("/state")) return { body: { values: { todos: [] } } };
+      return { body: {} };
+    });
+  }
+
+  it("returns 'end' when the stream sends an end frame", async () => {
+    const { fetchFn } = joinResponder(sseStream(["event: end\ndata: null\n\n"]));
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const outcome = await client.joinRunStream("t-1", "r-1", { timeoutMs: 2000 });
+    expect(outcome).toBe("end");
+  });
+
+  it("returns 'gap' when the stream sends a gap frame", async () => {
+    const { fetchFn } = joinResponder(
+      sseStream(['event: gap\ndata: {"code":"stream_replay_gap"}\n\n'])
+    );
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const outcome = await client.joinRunStream("t-1", "r-1", { timeoutMs: 2000 });
+    expect(outcome).toBe("gap");
+  });
+
+  it("forwards non-terminal frames to onEvent and heartbeats to onHeartbeat", async () => {
+    const { fetchFn } = joinResponder(
+      sseStream([
+        ": heartbeat\n\n",
+        'event: message\ndata: {"seq":1}\n\n',
+        "event: end\ndata: null\n\n",
+      ])
+    );
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const events: SseFrame[] = [];
+    let heartbeats = 0;
+    const outcome = await client.joinRunStream("t-1", "r-1", {
+      timeoutMs: 2000,
+      onEvent: (f) => events.push(f),
+      onHeartbeat: () => heartbeats++,
+    });
+    expect(outcome).toBe("end");
+    expect(heartbeats).toBe(1);
+    expect(events).toHaveLength(1);
+    expect(events[0].event).toBe("message");
+  });
+
+  it("returns 'timeout' when the budget elapses on an open stream", async () => {
+    const { fetchFn } = joinResponder(sseStream([": heartbeat\n\n"], { keepOpen: true }));
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const outcome = await client.joinRunStream("t-1", "r-1", { timeoutMs: 50 });
+    expect(outcome).toBe("timeout");
+  });
+
+  it("returns 'aborted' when the signal aborts", async () => {
+    const { fetchFn } = joinResponder(sseStream([": heartbeat\n\n"], { keepOpen: true }));
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const controller = new AbortController();
+    const promise = client.joinRunStream("t-1", "r-1", {
+      timeoutMs: 5000,
+      signal: controller.signal,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    controller.abort();
+    expect(await promise).toBe("aborted");
+  });
+
+  it("returns 'unavailable' when the join endpoint is 404", async () => {
+    const { fetchFn } = joinResponder(undefined, 404);
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const outcome = await client.joinRunStream("t-1", "r-1", { timeoutMs: 2000 });
+    expect(outcome).toBe("unavailable");
+  });
+});
+
+describe("buildWaitResult", () => {
+  const base: RunProgress = {
+    run_id: "r-1",
+    thread_id: "t-1",
+    status: "running",
+    terminal: false,
+    elapsed_seconds: 100,
+    quiet: false,
+    stalled: false,
+    activity: [],
+    todos: [],
+  };
+
+  it("returns a compact object on a quiet timeout with no activity", () => {
+    const res = buildWaitResult(base, "timeout", 30, 30, "https://deer.example.com");
+    expect(res.reason).toBe("timeout");
+    expect(res.timeout_seconds).toBe(30);
+    expect(res.waited_seconds).toBe(30);
+    expect(res.activity).toEqual([]);
+    expect(res.next_step).toMatch(/No new activity within 30s/);
+    expect("created_at" in res).toBe(false);
+    expect("seconds_since_activity" in res).toBe(false);
+  });
+
+  it("returns the full snapshot when there is activity", () => {
+    const res = buildWaitResult(
+      { ...base, activity: [{ seq: 5, kind: "tool", summary: "x" }], last_event_seq: 5 },
+      "timeout",
+      30,
+      30,
+      "https://deer.example.com"
+    );
+    expect(res.reason).toBe("timeout");
+    expect(res.activity).toHaveLength(1);
+    expect(res.last_event_seq).toBe(5);
+  });
+
+  it("returns the full snapshot for a client cancellation", () => {
+    const res = buildWaitResult(base, "timeout", 0, 30, "https://deer.example.com", {
+      stop_reason: "cancelled_by_client",
+    });
+    expect(res.stop_reason).toBe("cancelled_by_client");
+    expect(res.elapsed_seconds).toBe(100);
   });
 });

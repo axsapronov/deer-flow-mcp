@@ -110,6 +110,21 @@ function startStubDeerFlow(): Promise<{ url: string; server: http.Server }> {
       );
       return;
     }
+    // Run event stream (delta). Always empty in the stub.
+    if (method === "GET" && /\/api\/threads\/[^/]+\/runs\/[^/]+\/events$/.test(path)) {
+      res.end(JSON.stringify([]));
+      return;
+    }
+    // SSE join stream: a heartbeat followed by a terminal `end` frame, so the
+    // wait_activity tool's primary (SSE) path is exercised end to end.
+    const joinGet = path.match(/^\/api\/threads\/([^/]+)\/runs\/([^/]+)\/join$/);
+    if (method === "GET" && joinGet) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.write(": heartbeat\n\n");
+      res.write("event: end\ndata: null\n\n");
+      res.end();
+      return;
+    }
     if (method === "POST" && /^\/api\/threads\/[^/]+\/runs\/[^/]+\/cancel/.test(path)) {
       res.statusCode = 202;
       res.end();
@@ -344,6 +359,52 @@ describe.each([
     expect(text).toContain("Final findings.");
     expect(text).toContain("- mnt/user-data/outputs/report.md");
     expect(text).toContain("https://deer.example.com/workspace/chats/");
+  });
+
+  test("deerflow_wait_activity joins the run stream and reports a terminal result", async () => {
+    requests.length = 0;
+    const started = await client.callTool({
+      name: "deerflow_chat",
+      arguments: { message: "wait for me" },
+    });
+    const threadId = textOf(started).match(/"thread_id": "(t-\d+)"/)?.[1];
+    const runId = textOf(started).match(/"run_id": "(r-\d+)"/)?.[1];
+    expect(threadId && runId).toBeTruthy();
+
+    const res = await client.callTool({
+      name: "deerflow_wait_activity",
+      arguments: { thread_id: threadId!, run_id: runId!, timeout_seconds: 5 },
+    });
+    expect(res.isError).toBeFalsy();
+    expect(textOf(res)).toContain('"reason": "terminal"');
+
+    // The server must have attempted to join the run's live event stream.
+    const join = requests.find((r) => r.path === `/api/threads/${threadId}/runs/${runId}/join`);
+    expect(join).toBeDefined();
+  });
+
+  test("advertises and reads the report and artifact resources", async () => {
+    const templates = await client.listResourceTemplates();
+    const uris = templates.resourceTemplates.map((t) => t.uriTemplate);
+    expect(uris).toContain("deerflow://threads/{threadId}/report");
+    expect(uris).toContain("deerflow://threads/{threadId}/artifacts/{+path}");
+
+    const started = await client.callTool({
+      name: "deerflow_chat",
+      arguments: { message: "write a report" },
+    });
+    const threadId = textOf(started).match(/"thread_id": "(t-\d+)"/)?.[1];
+    expect(threadId).toBeTruthy();
+
+    const report = await client.readResource({ uri: `deerflow://threads/${threadId}/report` });
+    const reportText = (report.contents[0] as { text?: string }).text ?? "";
+    expect(reportText).toContain("Final findings.");
+
+    const artifact = await client.readResource({
+      uri: `deerflow://threads/${threadId}/artifacts/mnt/user-data/outputs/report.md`,
+    });
+    const artifactText = (artifact.contents[0] as { text?: string }).text ?? "";
+    expect(artifactText).toContain("# Report");
   });
 });
 

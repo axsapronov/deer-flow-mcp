@@ -12,6 +12,7 @@ import { Command } from "commander";
 import { loadConfig } from "./lib/config.js";
 import { DeerFlowClient } from "./lib/client.js";
 import { registerTools } from "./lib/tools.js";
+import { registerResources } from "./lib/resources.js";
 
 const SERVER_VERSION = "0.1.0";
 const DEFAULT_HTTP_PORT = 3000;
@@ -48,10 +49,12 @@ const SERVER_OPTIONS: ServerOptions = {
 
 Typical deep-research flow:
 1. Call deerflow_research with the topic — it starts a background run and returns thread_id, run_id, and a web URL immediately.
-2. Poll deerflow_wait_activity(thread_id, run_id, since_seq=<last_event_seq>, timeout_seconds=30) in a loop. Each call blocks server-side and returns what happened: new activity (tool calls, messages), the plan-mode todo checklist, and stall detection. Pass the returned last_event_seq as since_seq on the next call. Stop when status is a terminal value (success, error, timeout, interrupted).
-3. Call deerflow_get_report(thread_id, run_id) to read the synthesized report and artifact paths; use deerflow_get_artifact to read a specific file.
+2. Wait with deerflow_wait_activity(thread_id, run_id, since_seq=<last_event_seq>, timeout_seconds=30) in a loop. Each call blocks server-side (joining the run's live event stream, falling back to polling) and returns what happened: new activity (tool calls, messages), the plan-mode todo checklist, quiet/stall detection, and a next_step hint. It also emits MCP progress notifications while waiting. Pass the returned last_event_seq as since_seq on the next call. Stop when status is a terminal value (success, error, timeout, interrupted).
+3. Call deerflow_get_report(thread_id, run_id) to read the synthesized report and artifact paths (it auto-inlines the first text artifact when no assistant message exists); use deerflow_get_artifact to read a specific file.
 
-For quick non-blocking checks use deerflow_run_status (status + live counters: llm_call_count, message_count, total_tokens — if they stop advancing the run may be stalled) or deerflow_run_progress (event-level detail + todos).
+For quick non-blocking checks use deerflow_run_status (status + live counters: llm_call_count, message_count, total_tokens — if they stop advancing the run may be stalled) or deerflow_run_progress (event-level detail + todos + quiet/stall/next_step).
+
+The report and each artifact are also available as MCP resources: deerflow://threads/{thread_id}/report and deerflow://threads/{thread_id}/artifacts/{path}.
 
 For ordinary back-and-forth, use deerflow_chat (pass an existing thread_id to continue a conversation). Use deerflow_list_models to discover model names, deerflow_list_threads to find prior work, deerflow_cancel_run to stop a run, and deerflow_list_artifacts / deerflow_get_artifact to retrieve produced files.`,
 };
@@ -59,11 +62,13 @@ For ordinary back-and-forth, use deerflow_chat (pass an existing thread_id to co
 function makeServer(client: DeerFlowClient): McpServer {
   const server = new McpServer(SERVER_INFO, SERVER_OPTIONS);
   registerTools(server, client);
+  registerResources(server, client);
   return server;
 }
 
 function startStdio(): void {
-  const client = new DeerFlowClient(loadConfig());
+  const config = loadConfig();
+  const client = new DeerFlowClient(config, undefined, { pollIntervalMs: config.pollIntervalMs });
   const server = makeServer(client);
   const transport = new StdioServerTransport();
   void server.connect(transport).catch((err) => {
@@ -74,7 +79,8 @@ function startStdio(): void {
 }
 
 function startHttp(): void {
-  const client = new DeerFlowClient(loadConfig());
+  const config = loadConfig();
+  const client = new DeerFlowClient(config, undefined, { pollIntervalMs: config.pollIntervalMs });
   const handler = createMcpHandler(() => makeServer(client), {
     onerror: (err) => console.error("MCP handler error:", err),
   });

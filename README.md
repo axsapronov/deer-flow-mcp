@@ -46,18 +46,23 @@ own `env` / `environment` field (see [Install in an MCP client](#install-in-an-m
 The server **fails fast** with a descriptive error at startup if required values are missing, so
 the MCP client gets a clean error instead of a cryptic first-request failure.
 
-| Variable                           | Required     | Description                                                                  |
-| ---------------------------------- | ------------ | ---------------------------------------------------------------------------- |
-| `DEERFLOW_BASE_URL`                | yes          | Base URL of the deployed DeerFlow instance (trailing slashes ignored)        |
-| `DEERFLOW_EMAIL`                   | one of three | Account email; used with `DEERFLOW_PASSWORD` (tried first; full user access) |
-| `DEERFLOW_PASSWORD`                | one of three | Account password; used with `DEERFLOW_EMAIL` (tried first; full user access) |
-| `DEERFLOW_PAT`                     | one of three | Personal Access Token (starts with `dfp_`); threads/runs routes only         |
-| `DEERFLOW_INTERNAL_TOKEN`          | one of three | Gateway internal token; full access (models + artifact files)                |
-| `DEERFLOW_OWNER_USER_ID`           | no           | Used only with internal-token mode                                           |
-| `DEERFLOW_DEFAULT_MODEL`           | no           | Default model when a tool call omits `model`                                 |
-| `DEERFLOW_DEFAULT_RECURSION_LIMIT` | no           | Default LangGraph recursion limit (default `1000`)                           |
-| `DEERFLOW_TIMEOUT_MS`              | no           | Per-request HTTP timeout in ms (default `60000`)                             |
-| `DEERFLOW_WEB_BASE_URL`            | no           | Base URL for "open in DeerFlow" links (defaults to `DEERFLOW_BASE_URL`)      |
+| Variable                             | Required     | Description                                                                                          |
+| ------------------------------------ | ------------ | ---------------------------------------------------------------------------------------------------- |
+| `DEERFLOW_BASE_URL`                  | yes          | Base URL of the deployed DeerFlow instance (trailing slashes ignored)                                |
+| `DEERFLOW_EMAIL`                     | one of three | Account email; used with `DEERFLOW_PASSWORD` (tried first; full user access)                         |
+| `DEERFLOW_PASSWORD`                  | one of three | Account password; used with `DEERFLOW_EMAIL` (tried first; full user access)                         |
+| `DEERFLOW_PAT`                       | one of three | Personal Access Token (starts with `dfp_`); threads/runs routes only                                 |
+| `DEERFLOW_INTERNAL_TOKEN`            | one of three | Gateway internal token; full access (models + artifact files)                                        |
+| `DEERFLOW_OWNER_USER_ID`             | no           | Used only with internal-token mode                                                                   |
+| `DEERFLOW_DEFAULT_MODEL`             | no           | Default model when a tool call omits `model`                                                         |
+| `DEERFLOW_DEFAULT_RECURSION_LIMIT`   | no           | Default LangGraph recursion limit (default `1000`)                                                   |
+| `DEERFLOW_TIMEOUT_MS`                | no           | Per-request HTTP timeout in ms (default `60000`)                                                     |
+| `DEERFLOW_WEB_BASE_URL`              | no           | Base URL for "open in DeerFlow" links (defaults to `DEERFLOW_BASE_URL`)                              |
+| `DEERFLOW_STALL_THRESHOLD_SECONDS`   | no           | Seconds without activity before a running run is reported as stalled (default `180`)                 |
+| `DEERFLOW_QUIET_THRESHOLD_SECONDS`   | no           | Softer "between steps" signal, below the stall threshold (default `60`)                              |
+| `DEERFLOW_PROGRESS_WAIT_MAX_SECONDS` | no           | Cap on `deerflow_wait_activity` `timeout_seconds` (default `120`)                                    |
+| `DEERFLOW_PROGRESS_TICK_MS`          | no           | How often a `notifications/progress` update is emitted during a long wait (default `10000`)          |
+| `DEERFLOW_POLL_INTERVAL_MS`          | no           | How often the client polls the DeerFlow API when the SSE join stream is unavailable (default `2000`) |
 
 ### Authentication
 
@@ -424,20 +429,36 @@ Restart Claude Desktop after saving.
 
 ## Available MCP tools
 
-| Tool                      | Description                                                                                                                                                 |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `deerflow_research`       | Start a deep-research run on a fresh thread. Args: `topic`, optional `focus`, `model`, `recursion_limit`. Returns thread/run ids and a web URL immediately. |
-| `deerflow_chat`           | Send a message to a DeerFlow thread and start a run. Args: `message`, optional `thread_id`, `model`, `recursion_limit`.                                     |
-| `deerflow_run_status`     | Check a run's status, optionally waiting up to `wait_seconds` (0–30) for a terminal status. Args: `thread_id`, `run_id`, optional `wait_seconds`.           |
-| `deerflow_get_report`     | Fetch the synthesized report (title, assistant message, artifact paths). Args: `thread_id`, optional `run_id`.                                              |
-| `deerflow_list_threads`   | List recent threads. Args: optional `limit`, `include_archived`.                                                                                            |
-| `deerflow_cancel_run`     | Cancel (interrupt) an in-flight run. Args: `thread_id`, `run_id`.                                                                                           |
-| `deerflow_list_artifacts` | List artifact file paths produced by a thread. Args: `thread_id`.                                                                                           |
-| `deerflow_get_artifact`   | Fetch one artifact (inline text, or a URL for binary files). Args: `thread_id`, `path`.                                                                     |
-| `deerflow_list_models`    | List configured models (name, display name, capability flags). No args. Not available with a PAT (email/password or internal token required).               |
+| Tool                      | Description                                                                                                                                                                                                         |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deerflow_research`       | Start a deep-research run on a fresh thread. Args: `topic`, optional `focus`, `model`, `recursion_limit`. Returns thread/run ids and a web URL immediately.                                                         |
+| `deerflow_chat`           | Send a message to a DeerFlow thread and start a run. Args: `message`, optional `thread_id`, `model`, `recursion_limit`.                                                                                             |
+| `deerflow_run_status`     | Check a run's status, optionally waiting up to `wait_seconds` (0–30) for a terminal status. Args: `thread_id`, `run_id`, optional `wait_seconds`.                                                                   |
+| `deerflow_run_progress`   | Get live progress: status, live counters, recent activity (one-line event summaries), the plan-mode todo checklist, and stall/quiet detection. Args: `thread_id`, `run_id`, optional `since_seq`, `activity_limit`. |
+| `deerflow_wait_activity`  | Block server-side until new activity, a terminal status, or timeout — one call replaces many polls. Args: `thread_id`, `run_id`, optional `since_seq`, `timeout_seconds` (1–120). Emits MCP progress notifications. |
+| `deerflow_get_report`     | Fetch the synthesized report (title, assistant message, artifact paths). Args: `thread_id`, optional `run_id`.                                                                                                      |
+| `deerflow_list_threads`   | List recent threads. Args: optional `limit`, `include_archived`.                                                                                                                                                    |
+| `deerflow_cancel_run`     | Cancel (interrupt) an in-flight run. Args: `thread_id`, `run_id`.                                                                                                                                                   |
+| `deerflow_list_artifacts` | List artifact file paths produced by a thread. Args: `thread_id`.                                                                                                                                                   |
+| `deerflow_get_artifact`   | Fetch one artifact (inline text, or a URL for binary files). Args: `thread_id`, `path`.                                                                                                                             |
+| `deerflow_list_models`    | List configured models (name, display name, capability flags). No args. Not available with a PAT (email/password or internal token required).                                                                       |
 
 The server also advertises MCP `instructions` that walk a client through the typical deep-research
-flow: `deerflow_research` → poll `deerflow_run_status` → `deerflow_get_report` → `deerflow_get_artifact`.
+flow: `deerflow_research` → wait with `deerflow_wait_activity` (loop on `last_event_seq`) →
+`deerflow_get_report` → `deerflow_get_artifact`, with `deerflow_run_status` / `deerflow_run_progress`
+for quick non-blocking checks and the report + each artifact also exposed as MCP resources
+(`deerflow://threads/{thread_id}/report`, `deerflow://threads/{thread_id}/artifacts/{path}`).
+
+## Design decisions
+
+### No MCP Tasks extension (SEP-1686)
+
+The MCP **Tasks** extension (`tasks/get|result|list|cancel`) is intentionally **not** implemented.
+SDK 2.0.0 ships no Tasks runtime (`TaskRequestMethod` is excluded from the typed method surface),
+and a DeerFlow run is already a durable, addressable job keyed by `thread_id` / `run_id` —
+`deerflow_wait_activity` (long-poll) and `deerflow_run_status` (poll) are the spec's async-job
+surface, and `deerflow_get_report` plus the resources read the result. Revisit only if/when the
+SDK adds a Tasks runtime.
 
 ## Usage
 

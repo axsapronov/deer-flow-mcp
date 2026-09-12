@@ -77,8 +77,11 @@ MCP client gets a clean error instead of a cryptic first-request failure.
 - Optional defaults: `DEERFLOW_DEFAULT_MODEL`, `DEERFLOW_DEFAULT_RECURSION_LIMIT` (default 1000),
   `DEERFLOW_TIMEOUT_MS` (default 60000), `DEERFLOW_WEB_BASE_URL`,
   `DEERFLOW_STALL_THRESHOLD_SECONDS` (default 180 — seconds without activity before a running run is
-  reported as stalled), `DEERFLOW_PROGRESS_WAIT_MAX_SECONDS` (default 120 — cap for the
-  `deerflow_wait_activity` timeout)
+  reported as stalled), `DEERFLOW_QUIET_THRESHOLD_SECONDS` (default 60 — a softer "between steps"
+  signal, below the stall threshold), `DEERFLOW_PROGRESS_WAIT_MAX_SECONDS` (default 120 — cap for the
+  `deerflow_wait_activity` timeout), `DEERFLOW_PROGRESS_TICK_MS` (default 10000 — how often a
+  `notifications/progress` update is emitted during a long wait), `DEERFLOW_POLL_INTERVAL_MS`
+  (default 2000 — how often the client polls the DeerFlow API when the SSE join stream is unavailable)
 
 Auth is a discriminated union (`DeerFlowAuth`): either `pat` or `internal`. PAT callers
 cannot reach `/api/models` or individual artifact files (they 403); use internal-token
@@ -88,16 +91,37 @@ mode for full access.
 
 - Use the **v2** SDK: `import { McpServer } from "@modelcontextprotocol/server"` and
   `new McpServer({ name, version })`.
-- Register tools with `server.registerTool(name, { description, inputSchema }, handler)`.
-- Tool input schemas use **Standard Schema** — use `zod` v4 (`import * as z from "zod/v4"`).
+- Register tools with `server.registerTool(name, { description, inputSchema, outputSchema }, handler)`.
+- Tool input **and** output schemas use **Standard Schema** — use `zod` v4. Every tool
+  advertises an `outputSchema` and returns **both** a human-readable `content` text block
+  and a machine-readable `structuredContent` that matches it. The MCP client validates
+  `structuredContent` against `outputSchema` and **throws on a non-error result that omits
+  it**, so success paths must always return both; error results (`isError: true`) omit
+  `structuredContent`.
 - Transports: stdio via `@modelcontextprotocol/server/stdio`; HTTP via the
   `@modelcontextprotocol/node` Streamable HTTP wrapper. The CLI selects the transport
   (`--transport`); the `start` script defaults to `http`.
-- Tool handlers return MCP content: `{ content: [{ type: "text", text }] }`.
 - Tool `name` and `description` are the primary interface for LLM clients — make them
   clear, self-contained, and specific.
+- Resources (`src/lib/resources.ts`) expose the report and each artifact as addressable,
+  cacheable URIs (`deerflow://threads/{threadId}/report`,
+  `deerflow://threads/{threadId}/artifacts/{+path}`) via `registerResource` + `ResourceTemplate`.
+  `{+path}` matches a multi-segment path; a short `cacheHint` TTL keeps reads fresh.
+- `deerflow_wait_activity` joins the run's live SSE stream (primary) and falls back to
+  polling; it emits `notifications/progress` when the client supplies a progress token
+  (`ctx.mcpReq._meta?.progressToken`) and honors the client's `AbortSignal`
+  (`ctx.mcpReq.signal`) to cancel the wait.
 - Reuse the shared DeerFlow HTTP client and config from `src/lib/`; do **not** duplicate
   base-URL or auth logic per tool.
+
+### Design decision: no MCP Tasks extension (SEP-1686)
+
+The MCP **Tasks** extension (`tasks/get|result|list|cancel`) is intentionally **not**
+implemented. SDK 2.0.0 ships no tasks runtime (`TaskRequestMethod` is excluded from the
+typed method surface), and a DeerFlow run is already a durable, addressable job keyed by
+`thread_id`/`run_id` — `deerflow_wait_activity` (long-poll) and `deerflow_run_status`
+(poll) are the spec's async-job surface, and `get_report`/resources read the result.
+Revisit only if/when the SDK adds a tasks runtime.
 
 ## Code Style
 

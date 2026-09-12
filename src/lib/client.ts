@@ -5,6 +5,7 @@ import type {
   DeerFlowConfig,
   ModelInfo,
   Report,
+  ReportSource,
   RunActivityWaitResult,
   RunEventSummary,
   RunInfo,
@@ -160,6 +161,116 @@ function readSetCookies(res: Response): Map<string, string> {
   return map;
 }
 
+// --- SSE (Server-Sent Events) ------------------------------------------------
+
+/** A single parsed SSE frame. */
+export interface SseFrame {
+  /** The `event:` field (defaults to "message" when absent). */
+  event: string;
+  /** The `data:` payload (multiple `data:` lines joined with "\n"). */
+  data: string;
+  /** The `id:` field, when present. */
+  id?: string;
+}
+
+/** The outcome of waiting on a joined run SSE stream. */
+export type SseWaitOutcome = "end" | "gap" | "timeout" | "aborted" | "unavailable";
+
+/**
+ * A line-based SSE parser that survives frames split across arbitrary chunk
+ * boundaries. Handles `event:`/`data:`/`id:` fields, multi-line `data`, and
+ * comment lines (heartbeats). Feed it decoded text chunks via {@link feed}.
+ */
+export class SseParser {
+  private buffer = "";
+  private event = "";
+  private dataLines: string[] = [];
+  private id?: string;
+  /** True when the current frame carries at least one field. */
+  private hasField = false;
+
+  /**
+   * Feed a decoded text chunk. Invokes `onFrame` for each complete frame and
+   * `onComment` for each comment (heartbeat) line.
+   */
+  feed(chunk: string, onFrame: (frame: SseFrame) => void, onComment: () => void): void {
+    this.buffer += chunk;
+    let idx: number;
+    while ((idx = this.buffer.indexOf("\n")) !== -1) {
+      const line = this.buffer.slice(0, idx).replace(/\r$/, "");
+      this.buffer = this.buffer.slice(idx + 1);
+      this.processLine(line, onFrame, onComment);
+    }
+  }
+
+  private processLine(
+    line: string,
+    onFrame: (frame: SseFrame) => void,
+    onComment: () => void
+  ): void {
+    if (line === "") {
+      if (this.hasField) {
+        onFrame({
+          event: this.event || "message",
+          data: this.dataLines.join("\n"),
+          ...(this.id !== undefined ? { id: this.id } : {}),
+        });
+      }
+      this.event = "";
+      this.dataLines = [];
+      this.id = undefined;
+      this.hasField = false;
+      return;
+    }
+    if (line.startsWith(":")) {
+      onComment();
+      return;
+    }
+    const colon = line.indexOf(":");
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? "" : line.slice(colon + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    switch (field) {
+      case "event":
+        this.event = value;
+        this.hasField = true;
+        break;
+      case "data":
+        this.dataLines.push(value);
+        this.hasField = true;
+        break;
+      case "id":
+        this.id = value;
+        this.hasField = true;
+        break;
+      // ignore other fields (e.g. "retry")
+    }
+  }
+}
+
+/**
+ * Sleep for `ms` milliseconds, resolving early if `signal` aborts. Used so an
+ * in-flight wait can be cancelled by the client's AbortSignal.
+ */
+export function sleepInterruptible(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    const onAbort = () => done();
+    if (signal) {
+      if (signal.aborted) done();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
 /**
  * Thin, dependency-light client for the DeerFlow Gateway HTTP API.
  *
@@ -189,6 +300,16 @@ export class DeerFlowClient {
   /** Human link to a thread in the DeerFlow web UI. */
   webUrl(threadId: string): string {
     return `${this.config.webBaseUrl}/workspace/chats/${threadId}`;
+  }
+
+  /** The capped upper bound (seconds) for `waitForActivity` timeouts. */
+  get progressWaitMaxSeconds(): number {
+    return this.config.progressWaitMaxSeconds;
+  }
+
+  /** How often (ms) progress notifications are emitted during a long wait. */
+  get progressTickMs(): number {
+    return this.config.progressTickMs;
   }
 
   /**
@@ -569,6 +690,7 @@ export class DeerFlowClient {
     return composeProgress(run, events, todos, {
       baseUrl: this.config.webBaseUrl,
       stallThresholdSeconds: this.config.stallThresholdSeconds,
+      quietThresholdSeconds: this.config.quietThresholdSeconds,
       nowMs,
     });
   }
@@ -594,16 +716,152 @@ export class DeerFlowClient {
   }
 
   /**
+   * Join an existing run's SSE stream (`GET /api/threads/{id}/runs/{run_id}/join`)
+   * and wait for a terminal/gap/timeout/abort outcome. This is the primary
+   * "wait for the run to finish" mechanism: a single long-lived connection that
+   * receives the `end` frame exactly when the run ends, instead of polling
+   * every few seconds.
+   *
+   * Returns:
+   *  - `"end"`         — the `end` frame arrived (run reached a terminal state).
+   *  - `"gap"`         — a replay-gap frame arrived (fall back to durable state).
+   *  - `"timeout"`     — `timeoutMs` elapsed without an `end`/`gap` frame.
+   *  - `"aborted"`     — `signal` aborted the wait.
+   *  - `"unavailable"` — the stream could not be used (404/409/network error or
+   *                      no body); the caller should fall back to polling.
+   *
+   * SSE frames other than `end`/`gap` are forwarded to `onEvent`; heartbeat
+   * comment lines are forwarded to `onHeartbeat` (aliveness signal).
+   */
+  async joinRunStream(
+    threadId: string,
+    runId: string,
+    opts: {
+      signal?: AbortSignal;
+      timeoutMs: number;
+      onEvent?: (frame: SseFrame) => void;
+      onHeartbeat?: () => void;
+    }
+  ): Promise<SseWaitOutcome> {
+    const url = `${this.config.baseUrl}/api/threads/${encodeURIComponent(
+      threadId
+    )}/runs/${encodeURIComponent(runId)}/join`;
+    const controller = new AbortController();
+    let abortReason: "timeout" | "external" | undefined;
+    const onTimer = () => {
+      if (abortReason === undefined) abortReason = "timeout";
+      controller.abort();
+    };
+    const onExternal = () => {
+      if (abortReason === undefined) abortReason = "external";
+      controller.abort();
+    };
+    const timer = setTimeout(onTimer, opts.timeoutMs);
+    if (opts.signal) {
+      if (opts.signal.aborted) onExternal();
+      else opts.signal.addEventListener("abort", onExternal, { once: true });
+    }
+    const cleanup = () => {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onExternal);
+    };
+
+    let res: Response;
+    try {
+      if (this.config.auth.kind === "session") await this.ensureSession();
+      res = await this.fetchFn(url, {
+        method: "GET",
+        headers: { Accept: "text/event-stream", ...this.authHeaders() },
+        signal: controller.signal,
+      });
+    } catch {
+      cleanup();
+      return abortReason === "external" ? "aborted" : "unavailable";
+    }
+
+    if (!res.ok) {
+      // 404 (unknown run), 409 (store_only without a cross-process bridge), etc.
+      await res.body?.cancel().catch(() => {});
+      cleanup();
+      return abortReason === "external" ? "aborted" : "unavailable";
+    }
+    const body = res.body;
+    if (!body) {
+      cleanup();
+      return abortReason === "external" ? "aborted" : "unavailable";
+    }
+
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    const parser = new SseParser();
+    type SseReadResult = Awaited<ReturnType<typeof reader.read>>;
+    try {
+      for (;;) {
+        let chunk: SseReadResult;
+        try {
+          chunk = await reader.read();
+        } catch {
+          // read failed: an abort (timeout/external) or a mid-stream network error.
+          if (abortReason === "external") return "aborted";
+          if (abortReason === "timeout") return "timeout";
+          return "unavailable";
+        }
+        if (chunk.done) break; // the stream closed
+        const text = decoder.decode(chunk.value, { stream: true });
+        if (!text) continue;
+        let outcome: SseWaitOutcome | undefined;
+        parser.feed(
+          text,
+          (frame) => {
+            if (frame.event === "end") outcome = "end";
+            else if (frame.event === "gap") outcome = "gap";
+            else opts.onEvent?.(frame);
+          },
+          () => opts.onHeartbeat?.()
+        );
+        if (outcome) {
+          await reader.cancel().catch(() => {});
+          return outcome;
+        }
+      }
+      // The stream closed cleanly without an end/gap frame (e.g. the server
+      // ended the connection early, or a non-SSE body was returned). Fall back
+      // to polling rather than treating it as a timeout that ends the wait.
+      if (abortReason === "external") return "aborted";
+      if (abortReason === "timeout") return "timeout";
+      return "unavailable";
+    } finally {
+      cleanup();
+      await reader.cancel().catch(() => {});
+    }
+  }
+
+  /**
    * Server-side long-poll: wait until the run produces new activity (an event
    * with `seq > sinceSeq`), reaches a terminal status, or `timeoutSeconds`
-   * elapses. Polls every `pollIntervalMs` so a single MCP call replaces many
-   * status checks. Returns the full progress snapshot plus `reason` and
-   * `waited_seconds`.
+   * elapses.
+   *
+   * The primary mechanism is joining the run's SSE stream ({@link joinRunStream}):
+   * a single long-lived connection that receives the `end` frame exactly when
+   * the run ends. When the SSE stream is unavailable (404/409/network error or
+   * a replay gap), it falls back to polling the run row + event stream every
+   * `pollIntervalMs`.
+   *
+   * `signal` (the MCP client's AbortSignal) cancels the wait and the result
+   * carries `stop_reason: "cancelled_by_client"`. `onTick` is invoked
+   * periodically with the latest snapshot so the caller can emit progress
+   * notifications. Returns the progress snapshot plus `reason`,
+   * `waited_seconds`, and `timeout_seconds`.
    */
   async waitForActivity(
     threadId: string,
     runId: string,
-    opts: { sinceSeq?: number; timeoutSeconds?: number } = {}
+    opts: {
+      sinceSeq?: number;
+      timeoutSeconds?: number;
+      signal?: AbortSignal;
+      onTick?: (elapsedSeconds: number, snapshot: RunProgress) => void;
+    } = {}
   ): Promise<RunActivityWaitResult> {
     const timeoutSeconds = Math.max(
       1,
@@ -612,15 +870,17 @@ export class DeerFlowClient {
     const timeoutMs = timeoutSeconds * 1000;
     const startedAt = Date.now();
     let sinceSeq = opts.sinceSeq ?? 0;
-
-    const build = (progress: RunProgress, reason: ActivityWaitReason): RunActivityWaitResult => ({
-      ...progress,
-      reason,
-      waited_seconds: Math.max(0, Math.round((Date.now() - startedAt) / 1000)),
-    });
+    const signal = opts.signal;
+    const elapsed = () => Math.max(0, Math.round((Date.now() - startedAt) / 1000));
+    const build = (
+      progress: RunProgress,
+      reason: ActivityWaitReason,
+      extra?: Partial<RunActivityWaitResult>
+    ): RunActivityWaitResult =>
+      buildWaitResult(progress, reason, elapsed(), timeoutSeconds, this.config.webBaseUrl, extra);
 
     // Initial check (full snapshot, todos included).
-    const progress = await this.getProgress(threadId, runId, { sinceSeq });
+    let progress = await this.getProgress(threadId, runId, { sinceSeq });
     if (progress.terminal) return build(progress, "terminal");
     if (progress.activity.length > 0) {
       sinceSeq = progress.last_event_seq ?? sinceSeq;
@@ -628,24 +888,56 @@ export class DeerFlowClient {
     }
 
     const deadline = startedAt + timeoutMs;
+
+    // Primary: join the SSE stream for the remaining budget.
+    if (!signal?.aborted) {
+      const outcome = await this.joinRunStream(threadId, runId, {
+        signal,
+        timeoutMs: Math.max(0, deadline - Date.now()),
+        onHeartbeat: () => opts.onTick?.(elapsed(), progress),
+      });
+      if (outcome === "end") {
+        progress = await this.getProgress(threadId, runId, { sinceSeq });
+        return build(progress, "terminal");
+      }
+      if (outcome === "aborted") {
+        progress = await this.getProgress(threadId, runId, { sinceSeq });
+        return build(progress, "timeout", { stop_reason: "cancelled_by_client" });
+      }
+      if (outcome === "timeout") {
+        progress = await this.getProgress(threadId, runId, { sinceSeq });
+        return build(progress, "timeout");
+      }
+      // "gap" or "unavailable" → fall through to the polling fallback below.
+    }
+
+    // Fallback: poll the run row + event stream until the deadline.
     while (Date.now() < deadline) {
       const remaining = deadline - Date.now();
       const sleep = Math.max(0, Math.min(this.pollIntervalMs, remaining));
-      if (sleep > 0) await new Promise((resolve) => setTimeout(resolve, sleep));
+      if (sleep > 0) await sleepInterruptible(sleep, signal);
+      if (signal?.aborted) {
+        progress = await this.getProgress(threadId, runId, { sinceSeq });
+        return build(progress, "timeout", { stop_reason: "cancelled_by_client" });
+      }
       if (Date.now() >= deadline) break;
       const [run, events] = await Promise.all([
         this.getRun(threadId, runId),
         this.listRunEvents(threadId, runId, { limit: 20, afterSeq: sinceSeq }),
       ]);
       if (isTerminalRunStatus(run.status)) {
-        return build(await this.getProgress(threadId, runId, { sinceSeq }), "terminal");
+        progress = await this.getProgress(threadId, runId, { sinceSeq });
+        return build(progress, "terminal");
       }
       if (events.length > 0) {
         sinceSeq = Math.max(sinceSeq, ...events.map((e) => e.seq ?? 0));
-        return build(await this.getProgress(threadId, runId, { sinceSeq }), "activity");
+        progress = await this.getProgress(threadId, runId, { sinceSeq });
+        return build(progress, "activity");
       }
+      opts.onTick?.(elapsed(), progress);
     }
-    return build(await this.getProgress(threadId, runId, { sinceSeq }), "timeout");
+    progress = await this.getProgress(threadId, runId, { sinceSeq });
+    return build(progress, "timeout");
   }
 
   // --- Models & artifacts ------------------------------------------------
@@ -736,10 +1028,17 @@ export class DeerFlowClient {
   }
 
   /**
-   * Fetch the synthesized report for a thread: the most recent assistant
-   * message plus its title and artifacts. When `runId` is supplied, the
-   * run-scoped message log is used for the report text (more precise for a
-   * single run); otherwise the thread state's message history is used.
+   * Fetch the synthesized report for a thread. The report text is resolved
+   * through a fallback chain:
+   *   a. run-scoped messages (last 50, ascending) → last assistant text;
+   *   b. thread state `values.messages` → last assistant text (consulted only
+   *      when (a) yielded no assistant text);
+   *   c. `values.summary_text`;
+   *   d. run terminal and still empty → auto-inline the first text-like
+   *      artifact (≤ 256 KB), with an explicit note.
+   * When `runId` is supplied the run row is fetched for its status so the
+   * report can distinguish "run still in progress" from "run finished with no
+   * final chat text".
    */
   async getReport(threadId: string, runId?: string): Promise<Report> {
     const state = await this.getThreadState(threadId);
@@ -749,22 +1048,72 @@ export class DeerFlowClient {
       ? state.values!.artifacts!.map((p) => String(p))
       : [];
 
+    let run: RunInfo | undefined;
+    if (runId) {
+      try {
+        run = await this.getRun(threadId, runId);
+      } catch {
+        run = undefined; // run missing/unreadable — continue without its status
+      }
+    }
+    const terminal = run ? isTerminalRunStatus(run.status) : false;
+
+    // (a) primary: run-scoped messages (last 50, ascending).
     let messages: Record<string, unknown>[] = [];
     if (runId) {
-      const raw = await this.listRunMessages(threadId, runId, 50);
-      messages = raw.filter(isMessageObject) as Record<string, unknown>[];
+      try {
+        const raw = await this.listRunMessages(threadId, runId, 50);
+        messages = raw.filter(isMessageObject) as Record<string, unknown>[];
+      } catch {
+        messages = []; // message log unavailable — rely on the state fallback
+      }
     }
-    if (messages.length === 0 && Array.isArray(state.values?.messages)) {
-      messages = state.values!.messages!.filter(isMessageObject) as Record<string, unknown>[];
+    let report = lastAssistantText(messages);
+    let reportSource: ReportSource | undefined = report ? "run-messages" : undefined;
+
+    // (b) fallback: thread state messages — only when (a) found no assistant text.
+    if (!report && Array.isArray(state.values?.messages)) {
+      const stateMessages = state.values!.messages!.filter(isMessageObject) as Record<
+        string,
+        unknown
+      >[];
+      report = lastAssistantText(stateMessages);
+      if (report) reportSource = "state-messages";
     }
 
-    const report = lastAssistantText(messages) ?? summaryText ?? "";
+    // (c) fallback: summary_text.
+    if (!report && summaryText) {
+      report = summaryText;
+      reportSource = "summary";
+    }
+
+    // (d) terminal + still empty → auto-inline the first text-like artifact.
+    let artifactNote: string | undefined;
+    if (!report && terminal && artifacts.length > 0) {
+      for (const path of artifacts) {
+        try {
+          const artifact = await this.getArtifact(threadId, path);
+          if (artifact.content !== undefined) {
+            report = artifact.content;
+            reportSource = "artifact";
+            artifactNote = `The run has finished but produced no final chat message; the report below is inlined from the artifact "${path}".`;
+            break;
+          }
+        } catch {
+          // artifact unreadable (e.g. 403 for a PAT) — try the next one
+        }
+      }
+    }
+
     return {
-      report,
+      report: report ?? "",
       title,
       summary_text: summaryText,
       artifacts,
       web_url: this.webUrl(threadId),
+      ...(run ? { terminal, run_status: run.status } : {}),
+      ...(reportSource ? { report_source: reportSource } : {}),
+      ...(artifactNote ? { artifact_note: artifactNote } : {}),
     };
   }
 }
@@ -781,6 +1130,12 @@ interface RawRunResponse {
   total_tokens?: number;
   llm_call_count?: number;
   message_count?: number;
+  /**
+   * Kept for forward compatibility, but the backend's `RunResponse` does not
+   * currently populate this field. The authoritative error source is the run
+   * event stream (`run.error`/`llm.error` events), which `composeProgress`
+   * reads into `RunProgress.error`.
+   */
   error?: string | null;
 }
 
@@ -901,11 +1256,76 @@ function parseIsoMs(value: string | undefined): number | undefined {
 }
 
 /**
+ * Truncate a string to `max` chars, preferring a word boundary so we never cut
+ * mid-token (e.g. mid-JSON-key). Falls back to a hard cut when there is no
+ * reasonable boundary in the first half of the slice.
+ */
+function truncateAtWord(value: string, max: number): string {
+  if (value.length <= max) return value;
+  const sliced = value.slice(0, max);
+  const lastSpace = sliced.lastIndexOf(" ");
+  if (lastSpace >= max / 2) return `${sliced.slice(0, lastSpace).trimEnd()}…`;
+  return `${sliced}…`;
+}
+
+/**
+ * Reduce a tool-result payload to a short, human-readable summary. Handles the
+ * known shapes (web_search `total_results`, JSON/text error bodies) and falls
+ * back to a word-boundary truncation so we never cut mid-JSON.
+ */
+function summarizeToolResult(name: string, text: string): string {
+  const flat = oneLine(text, 200);
+  if (!flat) return `${name} → (no content)`;
+  const trimmed = flat.trim();
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = asRecord(JSON.parse(trimmed));
+      if (parsed) {
+        if (typeof parsed.total_results === "number") {
+          return `${name} → ${parsed.total_results} results`;
+        }
+        if (typeof parsed.error === "string" && parsed.error) {
+          return `${name} → error: ${truncateAtWord(parsed.error, 120)}`;
+        }
+      }
+    } catch {
+      // not valid JSON — fall through to plain-text handling
+    }
+  }
+  if (/^error:/i.test(flat)) {
+    const essence = flat.replace(/^error:/i, "").trim();
+    return `${name} → error: ${truncateAtWord(essence || flat, 120)}`;
+  }
+  if (/\berror\b/i.test(flat)) {
+    return `${name} → error: ${truncateAtWord(flat, 120)}`;
+  }
+  return `${name} → ${truncateAtWord(flat, 100)}`;
+}
+
+/**
  * Reduce one raw run event to a compact one-line summary. Exported for tests.
  */
 export function summarizeRunEvent(evt: RawRunEvent): RunEventSummary {
   const type = evt.event_type ?? "unknown";
   const base = { seq: evt.seq ?? 0, ...(evt.created_at ? { at: evt.created_at } : {}) };
+  if (type.startsWith("middleware:")) {
+    const label = type.slice("middleware:".length).replace(/_/g, " ");
+    const content = asRecord(evt.content);
+    const changes = asRecord(content?.changes);
+    const toolNames = Array.isArray(changes?.tool_names)
+      ? (changes!.tool_names as unknown[]).map((t) => String(t)).join(", ")
+      : undefined;
+    const count = typeof changes?.count === "number" ? changes.count : undefined;
+    let summary: string;
+    if (toolNames && count !== undefined) {
+      summary = `${label}: agent repeated ${toolNames} ${count} times`;
+    } else if (typeof content?.action === "string" && content.action) {
+      summary = `${label}: ${content.action}`;
+    } else {
+      summary = label;
+    }
+    return { ...base, kind: "warning", summary };
+  }
   switch (type) {
     case "llm.ai.response": {
       const msg = asRecord(evt.content);
@@ -926,21 +1346,26 @@ export function summarizeRunEvent(evt: RawRunEvent): RunEventSummary {
     case "llm.tool.result": {
       const msg = asRecord(evt.content);
       const name = typeof msg?.name === "string" ? msg.name : "tool";
-      const text = oneLine(
-        typeof msg?.content === "string" ? msg.content : messageText(msg ?? {}),
-        100
-      );
-      return {
-        ...base,
-        kind: "tool",
-        summary: text ? `${name} → ${text}` : `${name} → (no content)`,
-      };
+      const inner = typeof msg?.content === "string" ? msg.content : messageText(msg ?? {});
+      return { ...base, kind: "tool", summary: summarizeToolResult(name, inner) };
     }
     case "run.error":
     case "llm.error": {
       const text =
         typeof evt.content === "string" ? evt.content : JSON.stringify(evt.content ?? "");
       return { ...base, kind: "error", summary: `error: ${oneLine(text, 160)}` };
+    }
+    case "run.delivery": {
+      const content = asRecord(evt.content);
+      const msg =
+        (typeof content?.message === "string" && content.message) ||
+        (typeof content?.text === "string" && content.text) ||
+        (typeof content?.summary === "string" && content.summary);
+      return {
+        ...base,
+        kind: "other",
+        summary: msg ? `delivery: ${oneLine(msg, 100)}` : "run delivered",
+      };
     }
     default:
       return { ...base, kind: "other", summary: type };
@@ -956,7 +1381,12 @@ export function composeProgress(
   run: RunInfo,
   events: RawRunActivityLike[],
   todos: TodoItem[],
-  opts: { baseUrl: string; stallThresholdSeconds: number; nowMs: number }
+  opts: {
+    baseUrl: string;
+    stallThresholdSeconds: number;
+    quietThresholdSeconds: number;
+    nowMs: number;
+  }
 ): RunProgress {
   const terminal = isTerminalRunStatus(run.status);
 
@@ -985,6 +1415,10 @@ export function composeProgress(
       ? Math.max(0, Math.round((opts.nowMs - lastActivityMs) / 1000))
       : undefined;
 
+  const quiet =
+    !terminal &&
+    secondsSinceActivity !== undefined &&
+    secondsSinceActivity > opts.quietThresholdSeconds;
   const stalled =
     !terminal &&
     secondsSinceActivity !== undefined &&
@@ -1016,6 +1450,18 @@ export function composeProgress(
     }
   }
 
+  const webUrl = `${opts.baseUrl}/workspace/chats/${run.thread_id}`;
+  const hasStopReason = run.stop_reason !== null && run.stop_reason !== undefined;
+  const needsNextStep = !terminal && (quiet || stalled || error !== undefined || hasStopReason);
+  let nextStep: string | undefined;
+  if (needsNextStep) {
+    const lead =
+      secondsSinceActivity !== undefined
+        ? `Quiet for ${secondsSinceActivity}s`
+        : "No recent activity";
+    nextStep = `${lead} while the run is still "${run.status}" — keep waiting, or open ${webUrl} to check, or stop it with deerflow_cancel_run.`;
+  }
+
   return {
     run_id: run.run_id,
     thread_id: run.thread_id,
@@ -1032,15 +1478,82 @@ export function composeProgress(
     ...(lastEventSeq !== undefined ? { last_event_seq: lastEventSeq } : {}),
     ...(lastActivityAt !== undefined ? { last_activity_at: lastActivityAt } : {}),
     ...(secondsSinceActivity !== undefined ? { seconds_since_activity: secondsSinceActivity } : {}),
+    quiet,
     stalled,
     ...(stalled
       ? {
-          hint: `No activity for ${secondsSinceActivity}s while status is still "${run.status}". The run may be stuck on a long tool call or on a dead worker — open ${opts.baseUrl}/workspace/chats/${run.thread_id} to check, or stop it with deerflow_cancel_run.`,
+          hint: `No activity for ${secondsSinceActivity}s while status is still "${run.status}". The run may be stuck on a long tool call or on a dead worker — open ${webUrl} to check, or stop it with deerflow_cancel_run.`,
         }
       : {}),
+    ...(nextStep !== undefined ? { next_step: nextStep } : {}),
     ...(error ? { error: truncate(error, 500) } : {}),
     activity,
     todos,
+  };
+}
+
+/**
+ * Build a {@link RunActivityWaitResult} from a progress snapshot.
+ *
+ * When the wait timed out with no activity and no quiet/stalled/error signal,
+ * a compact object is returned (no duplicated timestamps/snapshot) carrying
+ * `status`, counters, `last_event_seq`, and a `next_step`. Otherwise the full
+ * snapshot is returned. A `timeout` reason always carries a `next_step`. A
+ * `stop_reason: "cancelled_by_client"` (client abort) always yields the full
+ * snapshot.
+ */
+export function buildWaitResult(
+  progress: RunProgress,
+  reason: ActivityWaitReason,
+  waitedSeconds: number,
+  timeoutSeconds: number,
+  baseUrl: string,
+  extra?: Partial<RunActivityWaitResult>
+): RunActivityWaitResult {
+  const webUrl = `${baseUrl}/workspace/chats/${progress.thread_id}`;
+  let nextStep = progress.next_step;
+  if (reason === "timeout" && !nextStep) {
+    nextStep = `No new activity within ${timeoutSeconds}s — call deerflow_wait_activity again (pass last_event_seq as since_seq) to keep waiting, or open ${webUrl} to check, or stop it with deerflow_cancel_run.`;
+  }
+  const cancelled = extra?.stop_reason === "cancelled_by_client";
+  const compact =
+    reason === "timeout" &&
+    !cancelled &&
+    progress.activity.length === 0 &&
+    !progress.quiet &&
+    !progress.stalled &&
+    !progress.error;
+  if (compact) {
+    return {
+      run_id: progress.run_id,
+      thread_id: progress.thread_id,
+      status: progress.status,
+      terminal: progress.terminal,
+      elapsed_seconds: progress.elapsed_seconds,
+      ...(progress.seconds_since_activity !== undefined
+        ? { seconds_since_activity: progress.seconds_since_activity }
+        : {}),
+      ...(progress.total_tokens !== undefined ? { total_tokens: progress.total_tokens } : {}),
+      ...(progress.llm_call_count !== undefined ? { llm_call_count: progress.llm_call_count } : {}),
+      ...(progress.message_count !== undefined ? { message_count: progress.message_count } : {}),
+      ...(progress.last_event_seq !== undefined ? { last_event_seq: progress.last_event_seq } : {}),
+      quiet: false,
+      stalled: false,
+      ...(nextStep !== undefined ? { next_step: nextStep } : {}),
+      activity: [],
+      todos: progress.todos,
+      reason,
+      waited_seconds: waitedSeconds,
+      timeout_seconds: timeoutSeconds,
+    };
+  }
+  return {
+    ...progress,
+    ...(nextStep !== undefined ? { next_step: nextStep } : {}),
+    ...(extra ?? {}),
+    reason,
+    waited_seconds: waitedSeconds,
+    timeout_seconds: timeoutSeconds,
   };
 }
 

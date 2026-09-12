@@ -57,7 +57,7 @@ export interface RunEventSummary {
   seq: number;
   /** Event timestamp (ISO 8601). */
   at?: string;
-  kind: "ai" | "tool" | "error" | "other";
+  kind: "ai" | "tool" | "error" | "warning" | "other";
   /** One-line description, e.g. `web_search("vLLM v0.25.0 ...") -> 10 results`. */
   summary: string;
 }
@@ -88,10 +88,18 @@ export interface RunProgress {
   last_activity_at?: string;
   /** Seconds since the most recent activity signal. */
   seconds_since_activity?: number;
+  /** True when a non-terminal run has had no activity for longer than the quiet threshold. */
+  quiet: boolean;
   /** True when a non-terminal run has had no activity for longer than the stall threshold. */
   stalled: boolean;
   /** Human hint explaining a stalled run, present only when `stalled` is true. */
   hint?: string;
+  /**
+   * Human next-step suggestion, present whenever the run needs attention:
+   * `quiet`/`stalled`, an `error`/`stop_reason`, or (for `wait_activity`) a
+   * `timeout` reason. Points at the web UI and the cancel tool.
+   */
+  next_step?: string;
   /** Error text from the run row or a `run.error`/`llm.error` event, when present. */
   error?: string;
   /** Recent activity, oldest first (delta mode: only events after `since_seq`). */
@@ -108,12 +116,17 @@ export interface RunActivityWaitResult extends RunProgress {
   reason: ActivityWaitReason;
   /** Seconds the server-side poll actually waited. */
   waited_seconds: number;
+  /** The effective wait budget in seconds (requested timeout, capped server-side). */
+  timeout_seconds: number;
 }
 
 /** A file produced by a run, addressable via the artifacts endpoint. */
 export interface ArtifactRef {
   path: string;
 }
+
+/** Where the report text came from in the resolution chain. */
+export type ReportSource = "run-messages" | "state-messages" | "summary" | "artifact";
 
 /** The synthesized final report for a completed run. */
 export interface Report {
@@ -122,6 +135,14 @@ export interface Report {
   summary_text?: string | null;
   artifacts: string[];
   web_url: string;
+  /** Terminal status of the run (present when a run_id was supplied). */
+  terminal?: boolean;
+  /** The run's status (present when a run_id was supplied). */
+  run_status?: RunStatus;
+  /** Where the report text came from (present when non-empty). */
+  report_source?: ReportSource;
+  /** Note explaining an auto-inlined artifact report (present when report_source === "artifact"). */
+  artifact_note?: string;
 }
 
 /** A configured model (from `GET /api/models`). */
@@ -154,6 +175,16 @@ export interface DeerFlowConfig {
   timeoutMs: number;
   /** Seconds without any activity signal before a running run is reported as stalled. */
   stallThresholdSeconds: number;
+  /**
+   * Seconds without any activity signal before a running run is reported as
+   * "quiet" (a softer signal than `stalled`: the run is likely just between
+   * steps, not stuck).
+   */
+  quietThresholdSeconds: number;
   /** Upper bound (seconds) for the `deerflow_wait_activity` timeout parameter. */
   progressWaitMaxSeconds: number;
+  /** How often (ms) to emit a `notifications/progress` update during a long wait. */
+  progressTickMs: number;
+  /** How often (ms) the client polls the DeerFlow API while waiting. */
+  pollIntervalMs: number;
 }
