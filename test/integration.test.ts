@@ -28,7 +28,9 @@ const ALL_TOOLS = [
   "deerflow_list_models",
   "deerflow_list_threads",
   "deerflow_research",
+  "deerflow_run_progress",
   "deerflow_run_status",
+  "deerflow_wait_activity",
 ].sort();
 
 // --- Stub DeerFlow API ------------------------------------------------------
@@ -258,7 +260,7 @@ describe.each([
     await client.close();
   });
 
-  test("lists the nine DeerFlow tools with derived input schemas", async () => {
+  test("lists the eleven DeerFlow tools with derived input schemas", async () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(ALL_TOOLS);
 

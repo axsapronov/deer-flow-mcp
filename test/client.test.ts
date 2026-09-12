@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { DeerFlowClient, DeerFlowError } from "../src/lib/client.js";
+import { DeerFlowClient, DeerFlowError, summarizeRunEvent } from "../src/lib/client.js";
 import { makeConfig, createMockFetch } from "./helpers.js";
 
 describe("DeerFlowClient", () => {
@@ -272,5 +272,177 @@ describe("DeerFlowClient", () => {
     status = 503;
     const err503 = await client.listModels().catch((e) => e);
     expect((err503 as DeerFlowError).retryable).toBe(true);
+  });
+});
+
+describe("DeerFlowClient progress & activity", () => {
+  const NOW = Date.parse("2026-09-12T04:10:00.000Z");
+
+  function runRow(overrides: Record<string, unknown> = {}) {
+    return {
+      run_id: "r-1",
+      status: "running",
+      created_at: "2026-09-12T03:53:51.000Z",
+      updated_at: "2026-09-12T04:09:50.000Z",
+      total_tokens: 1000,
+      llm_call_count: 20,
+      message_count: 52,
+      ...overrides,
+    };
+  }
+
+  const EVENTS = [
+    {
+      seq: 39,
+      event_type: "llm.ai.response",
+      created_at: "2026-09-12T04:09:40.000Z",
+      content: {
+        type: "ai",
+        content: "",
+        tool_calls: [{ name: "web_search", args: { query: "vLLM v0.25.0" } }],
+      },
+    },
+    {
+      seq: 40,
+      event_type: "llm.tool.result",
+      created_at: "2026-09-12T04:09:50.000Z",
+      content: { type: "tool", name: "web_search", content: "10 results found" },
+    },
+  ];
+
+  const TODOS = [
+    { content: "Gather history", status: "in_progress" },
+    { content: "Write report", status: "pending" },
+  ];
+
+  /** Routes the three endpoints getProgress uses (URLs carry query strings). */
+  function progressResponder(run: Record<string, unknown>, events: unknown[]) {
+    return (call: { url: string }) => {
+      if (call.url.includes("/runs/r-1/events")) return { body: events };
+      if (call.url.includes("/runs/r-1")) return { body: run };
+      if (call.url.endsWith("/state")) return { body: { values: { todos: TODOS } } };
+      return { body: {} };
+    };
+  }
+
+  it("listRunEvents sends limit and omits after_seq=0", async () => {
+    const { fetchFn, calls } = createMockFetch(() => ({ body: [] }));
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    await client.listRunEvents("t-1", "r-1", { limit: 10, afterSeq: 0 });
+    expect(calls[0].url).toBe("https://deer.example.com/api/threads/t-1/runs/r-1/events?limit=10");
+    await client.listRunEvents("t-1", "r-1", { limit: 10, afterSeq: 5 });
+    expect(calls[1].url).toBe(
+      "https://deer.example.com/api/threads/t-1/runs/r-1/events?limit=10&after_seq=5"
+    );
+  });
+
+  it("getTodos reads state.values.todos", async () => {
+    const { fetchFn } = createMockFetch(() => ({ body: { values: { todos: TODOS } } }));
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    expect(await client.getTodos("t-1")).toEqual(TODOS);
+  });
+
+  it("summarizeRunEvent renders tool calls, tool results, errors, and text", () => {
+    const ai = summarizeRunEvent(EVENTS[0]);
+    expect(ai.kind).toBe("ai");
+    expect(ai.summary).toContain("web_search(vLLM v0.25.0)");
+    const tool = summarizeRunEvent(EVENTS[1]);
+    expect(tool.kind).toBe("tool");
+    expect(tool.summary).toBe("web_search → 10 results found");
+    const err = summarizeRunEvent({
+      seq: 41,
+      event_type: "run.error",
+      created_at: "2026-09-12T04:11:00.000Z",
+      content: "boom happened",
+    });
+    expect(err.kind).toBe("error");
+    expect(err.summary).toBe("error: boom happened");
+    const text = summarizeRunEvent({
+      seq: 42,
+      event_type: "llm.ai.response",
+      content: { type: "ai", content: "Final answer text" },
+    });
+    expect(text.kind).toBe("ai");
+    expect(text.summary).toBe("Final answer text");
+  });
+
+  it("getProgress composes run counters, activity, and todos", async () => {
+    const { fetchFn } = createMockFetch(progressResponder(runRow(), EVENTS));
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const p = await client.getProgress("t-1", "r-1", { now: NOW });
+    expect(p.status).toBe("running");
+    expect(p.terminal).toBe(false);
+    expect(p.elapsed_seconds).toBe(969);
+    expect(p.seconds_since_update).toBe(10);
+    expect(p.seconds_since_activity).toBe(10);
+    expect(p.last_event_seq).toBe(40);
+    expect(p.llm_call_count).toBe(20);
+    expect(p.message_count).toBe(52);
+    expect(p.total_tokens).toBe(1000);
+    expect(p.stalled).toBe(false);
+    expect(p.todos).toEqual(TODOS);
+    expect(p.activity).toHaveLength(2);
+    expect(p.activity[0].summary).toContain("web_search(vLLM v0.25.0)");
+  });
+
+  it("getProgress flags a stalled run with a hint", async () => {
+    const stale = runRow({
+      created_at: "2026-09-12T03:00:00.000Z",
+      updated_at: "2026-09-12T03:50:00.000Z",
+    });
+    const staleEvents = EVENTS.map((e) => ({ ...e, created_at: "2026-09-12T03:50:00.000Z" }));
+    const { fetchFn } = createMockFetch(progressResponder(stale, staleEvents));
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const p = await client.getProgress("t-1", "r-1", { now: NOW });
+    expect(p.stalled).toBe(true);
+    expect(p.seconds_since_activity).toBe(1200);
+    expect(p.hint).toMatch(/No activity for 1200s/);
+    expect(p.hint).toContain("https://deer.example.com/workspace/chats/t-1");
+  });
+
+  it("getProgress surfaces a run.error event as error text", async () => {
+    const events = [
+      {
+        seq: 41,
+        event_type: "run.error",
+        created_at: "2026-09-12T04:09:00.000Z",
+        content: "Recursion limit exceeded",
+      },
+    ];
+    const { fetchFn } = createMockFetch(progressResponder(runRow({ status: "error" }), events));
+    const client = new DeerFlowClient(makeConfig(), fetchFn);
+    const p = await client.getProgress("t-1", "r-1", { now: NOW });
+    expect(p.terminal).toBe(true);
+    expect(p.error).toBe("Recursion limit exceeded");
+    expect(p.stalled).toBe(false);
+  });
+
+  it("waitForActivity returns 'activity' immediately when new events exist", async () => {
+    const { fetchFn, calls } = createMockFetch(progressResponder(runRow(), EVENTS));
+    const client = new DeerFlowClient(makeConfig(), fetchFn, { pollIntervalMs: 1 });
+    const res = await client.waitForActivity("t-1", "r-1", { sinceSeq: 38 });
+    expect(res.reason).toBe("activity");
+    expect(res.last_event_seq).toBe(40);
+    expect(res.waited_seconds).toBe(0);
+    // The delta query must use the provided cursor.
+    expect(calls.some((c) => c.url.includes("after_seq=38"))).toBe(true);
+  });
+
+  it("waitForActivity returns 'terminal' for a finished run", async () => {
+    const { fetchFn } = createMockFetch(progressResponder(runRow({ status: "success" }), []));
+    const client = new DeerFlowClient(makeConfig(), fetchFn, { pollIntervalMs: 1 });
+    const res = await client.waitForActivity("t-1", "r-1");
+    expect(res.reason).toBe("terminal");
+    expect(res.status).toBe("success");
+  });
+
+  it("waitForActivity returns 'timeout' when nothing changes", async () => {
+    const { fetchFn } = createMockFetch(progressResponder(runRow(), []));
+    const client = new DeerFlowClient(makeConfig(), fetchFn, { pollIntervalMs: 1 });
+    const res = await client.waitForActivity("t-1", "r-1", { timeoutSeconds: 1 });
+    expect(res.reason).toBe("timeout");
+    expect(res.status).toBe("running");
+    expect(res.waited_seconds).toBeGreaterThanOrEqual(1);
+    expect(res.activity).toEqual([]);
   });
 });

@@ -9,6 +9,8 @@ export function makeConfig(overrides: Partial<DeerFlowConfig> = {}): DeerFlowCon
     auth: { kind: "pat", token: "dfp_testtoken" },
     defaultRecursionLimit: 1000,
     timeoutMs: 60_000,
+    stallThresholdSeconds: 180,
+    progressWaitMaxSeconds: 120,
     ...overrides,
   };
 }

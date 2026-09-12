@@ -35,6 +35,79 @@ export interface RunInfo {
   stop_reason?: string | null;
   created_at?: string;
   updated_at?: string;
+  /** Total tokens consumed so far (advances while the run is working). */
+  total_tokens?: number;
+  /** Number of LLM calls made so far (advances while the run is working). */
+  llm_call_count?: number;
+  /** Number of persisted messages so far (advances while the run is working). */
+  message_count?: number;
+}
+
+/** A plan-mode task from the thread state's `todos` channel. */
+export interface TodoItem {
+  content: string;
+  status: string;
+}
+
+/**
+ * A compact, displayable summary of one persisted run event (from
+ * `GET /api/threads/{id}/runs/{run_id}/events`).
+ */
+export interface RunEventSummary {
+  seq: number;
+  /** Event timestamp (ISO 8601). */
+  at?: string;
+  kind: "ai" | "tool" | "error" | "other";
+  /** One-line description, e.g. `web_search("vLLM v0.25.0 ...") -> 10 results`. */
+  summary: string;
+}
+
+/**
+ * A live progress snapshot for a run, composed from the run row (counters +
+ * timestamps), the run event stream (latest activity), and the thread state
+ * (plan-mode todo checklist).
+ */
+export interface RunProgress {
+  run_id: string;
+  thread_id: string;
+  status: RunStatus;
+  stop_reason?: string | null;
+  terminal: boolean;
+  created_at?: string;
+  updated_at?: string;
+  /** Seconds since the run was created. */
+  elapsed_seconds: number;
+  /** Seconds since the run row was last updated (progress-snapshot heartbeat). */
+  seconds_since_update?: number;
+  total_tokens?: number;
+  llm_call_count?: number;
+  message_count?: number;
+  /** Highest event seq observed (pass back as `since_seq` to get only new events). */
+  last_event_seq?: number;
+  /** Timestamp of the most recent activity signal (event or run update). */
+  last_activity_at?: string;
+  /** Seconds since the most recent activity signal. */
+  seconds_since_activity?: number;
+  /** True when a non-terminal run has had no activity for longer than the stall threshold. */
+  stalled: boolean;
+  /** Human hint explaining a stalled run, present only when `stalled` is true. */
+  hint?: string;
+  /** Error text from the run row or a `run.error`/`llm.error` event, when present. */
+  error?: string;
+  /** Recent activity, oldest first (delta mode: only events after `since_seq`). */
+  activity: RunEventSummary[];
+  /** Plan-mode checklist from the thread state (empty when plan mode is off). */
+  todos: TodoItem[];
+}
+
+/** Why a `waitForActivity` long-poll returned. */
+export type ActivityWaitReason = "terminal" | "activity" | "timeout";
+
+/** The result of a `waitForActivity` long-poll. */
+export interface RunActivityWaitResult extends RunProgress {
+  reason: ActivityWaitReason;
+  /** Seconds the server-side poll actually waited. */
+  waited_seconds: number;
 }
 
 /** A file produced by a run, addressable via the artifacts endpoint. */
@@ -79,4 +152,8 @@ export interface DeerFlowConfig {
   defaultModel?: string;
   defaultRecursionLimit: number;
   timeoutMs: number;
+  /** Seconds without any activity signal before a running run is reported as stalled. */
+  stallThresholdSeconds: number;
+  /** Upper bound (seconds) for the `deerflow_wait_activity` timeout parameter. */
+  progressWaitMaxSeconds: number;
 }

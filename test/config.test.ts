@@ -98,4 +98,31 @@ describe("loadConfig", () => {
       })
     ).toThrow(ConfigError);
   });
+
+  it("defaults the stall threshold and progress wait cap", () => {
+    const cfg = loadConfig({ DEERFLOW_BASE_URL: "https://x.example", DEERFLOW_PAT: "dfp_x" });
+    expect(cfg.stallThresholdSeconds).toBe(180);
+    expect(cfg.progressWaitMaxSeconds).toBe(120);
+  });
+
+  it("honors explicit stall threshold and progress wait cap overrides", () => {
+    const cfg = loadConfig({
+      DEERFLOW_BASE_URL: "https://x.example",
+      DEERFLOW_PAT: "dfp_x",
+      DEERFLOW_STALL_THRESHOLD_SECONDS: "60",
+      DEERFLOW_PROGRESS_WAIT_MAX_SECONDS: "300",
+    });
+    expect(cfg.stallThresholdSeconds).toBe(60);
+    expect(cfg.progressWaitMaxSeconds).toBe(300);
+  });
+
+  it("rejects a non-integer stall threshold", () => {
+    expect(() =>
+      loadConfig({
+        DEERFLOW_BASE_URL: "https://x.example",
+        DEERFLOW_PAT: "dfp_x",
+        DEERFLOW_STALL_THRESHOLD_SECONDS: "abc",
+      })
+    ).toThrow(ConfigError);
+  });
 });

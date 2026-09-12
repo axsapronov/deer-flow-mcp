@@ -34,6 +34,12 @@ function withTool(fn: () => Promise<ToolResult>): Promise<ToolResult> {
   })();
 }
 
+function parseIsoMs(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
 /**
  * Register the DeerFlow toolset on an MCP server. Each tool is a thin wrapper
  * over a {@link DeerFlowClient} method.
@@ -127,7 +133,7 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
     {
       title: "Get Run Status",
       description:
-        "Check the status of a DeerFlow run. Optionally wait up to wait_seconds (capped at 30s) for it to reach a terminal status before returning, to reduce polling round-trips. Terminal statuses: success, error, timeout, interrupted.",
+        "Check the status of a DeerFlow run. Optionally wait up to wait_seconds (capped at 30s) for it to reach a terminal status before returning, to reduce polling round-trips. Terminal statuses: success, error, timeout, interrupted. Also returns live counters (llm_call_count, message_count, total_tokens) and elapsed/last-update times: the counters advance while the run is working, so if they stop moving for several minutes the run may be stalled — use deerflow_run_progress or deerflow_wait_activity for event-level detail.",
       inputSchema: z.object({
         thread_id: z.string().describe("The thread id."),
         run_id: z.string().describe("The run id."),
@@ -149,19 +155,111 @@ export function registerTools(server: McpServer, client: DeerFlowClient): void {
     (args) =>
       withTool(async () => {
         const run = await client.waitForRun(args.thread_id, args.run_id, args.wait_seconds ?? 0);
-        return textResult(
-          JSON.stringify(
-            {
-              thread_id: run.thread_id,
-              run_id: run.run_id,
-              status: run.status,
-              stop_reason: run.stop_reason ?? null,
-              terminal: isTerminalRunStatus(run.status),
-            },
-            null,
-            2
-          )
-        );
+        const now = Date.now();
+        const out: Record<string, unknown> = {
+          thread_id: run.thread_id,
+          run_id: run.run_id,
+          status: run.status,
+          stop_reason: run.stop_reason ?? null,
+          terminal: isTerminalRunStatus(run.status),
+        };
+        const createdMs = parseIsoMs(run.created_at);
+        const updatedMs = parseIsoMs(run.updated_at);
+        if (createdMs !== undefined)
+          out.elapsed_seconds = Math.max(0, Math.round((now - createdMs) / 1000));
+        if (updatedMs !== undefined) {
+          out.updated_at = run.updated_at;
+          out.seconds_since_update = Math.max(0, Math.round((now - updatedMs) / 1000));
+        }
+        if (run.llm_call_count !== undefined) out.llm_call_count = run.llm_call_count;
+        if (run.message_count !== undefined) out.message_count = run.message_count;
+        if (run.total_tokens !== undefined) out.total_tokens = run.total_tokens;
+        if (run.error) out.error = run.error;
+        return textResult(JSON.stringify(out, null, 2));
+      })
+  );
+
+  server.registerTool(
+    "deerflow_run_progress",
+    {
+      title: "Get Run Progress",
+      description:
+        "Get live progress for a DeerFlow run: status + live counters (llm_call_count, message_count, total_tokens), recent activity (the latest events as one-line summaries, e.g. tool calls and their results), the plan-mode todo checklist, and stall detection (stalled: true when no activity for longer than the configured threshold while the run is still running, with a hint). Pass since_seq (the last_event_seq from a previous response) to return only new events. Requires session or internal-token auth: the event stream and thread state are not reachable with a Personal Access Token.",
+      inputSchema: z.object({
+        thread_id: z.string().describe("The thread id."),
+        run_id: z.string().describe("The run id."),
+        since_seq: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Only include events with seq greater than this (delta mode; use last_event_seq from a previous response)."
+          ),
+        activity_limit: z
+          .number()
+          .int()
+          .min(1)
+          .max(50)
+          .optional()
+          .describe("Maximum recent events to summarize (default 10)."),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
+    },
+    (args) =>
+      withTool(async () => {
+        const progress = await client.getProgress(args.thread_id, args.run_id, {
+          sinceSeq: args.since_seq,
+          activityLimit: args.activity_limit,
+        });
+        return textResult(JSON.stringify(progress, null, 2));
+      })
+  );
+
+  server.registerTool(
+    "deerflow_wait_activity",
+    {
+      title: "Wait for Run Activity",
+      description:
+        "Block server-side until the run produces new activity, reaches a terminal status, or the timeout elapses — one call replaces many status polls (the server re-checks the event stream every few seconds). Returns reason ('terminal' | 'activity' | 'timeout'), waited_seconds, the new activity since since_seq (one-line summaries), the plan-mode todo checklist, and stall detection. Pass the returned last_event_seq as since_seq on the next call to continue from where you left off. Requires session or internal-token auth.",
+      inputSchema: z.object({
+        thread_id: z.string().describe("The thread id."),
+        run_id: z.string().describe("The run id."),
+        since_seq: z
+          .number()
+          .int()
+          .min(0)
+          .optional()
+          .describe(
+            "Only report events with seq greater than this (use last_event_seq from a previous response; 0 or omitted = latest events)."
+          ),
+        timeout_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .max(120)
+          .optional()
+          .describe("Maximum seconds to wait before returning (default 30, capped server-side)."),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        openWorldHint: true,
+        idempotentHint: true,
+      },
+    },
+    (args) =>
+      withTool(async () => {
+        const result = await client.waitForActivity(args.thread_id, args.run_id, {
+          sinceSeq: args.since_seq,
+          timeoutSeconds: args.timeout_seconds,
+        });
+        return textResult(JSON.stringify(result, null, 2));
       })
   );
 

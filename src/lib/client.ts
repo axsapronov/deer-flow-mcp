@@ -1,12 +1,17 @@
 import { fetch as undiciFetch } from "undici";
 import type {
+  ActivityWaitReason,
   ArtifactRef,
   DeerFlowConfig,
   ModelInfo,
   Report,
+  RunActivityWaitResult,
+  RunEventSummary,
   RunInfo,
+  RunProgress,
   RunStatus,
   ThreadSummary,
+  TodoItem,
 } from "./types.js";
 import { isTerminalRunStatus } from "./types.js";
 import { buildResearchPrompt, type ResearchPromptOptions } from "./prompts.js";
@@ -504,6 +509,145 @@ export class DeerFlowClient {
     return info;
   }
 
+  // --- Progress & activity ----------------------------------------------
+
+  /**
+   * Fetch persisted run events (the audit/progress stream). Without
+   * `afterSeq` the latest `limit` events are returned, ascending; with
+   * `afterSeq` only events with `seq > afterSeq` (forward delta).
+   */
+  async listRunEvents(
+    threadId: string,
+    runId: string,
+    opts: { limit?: number; afterSeq?: number } = {}
+  ): Promise<RawRunEvent[]> {
+    const params: string[] = [];
+    if (opts.limit !== undefined) params.push(`limit=${opts.limit}`);
+    // The backend validates after_seq with ge=1; 0 (no cursor) must be omitted.
+    if (opts.afterSeq !== undefined && opts.afterSeq > 0) params.push(`after_seq=${opts.afterSeq}`);
+    const qs = params.length > 0 ? `?${params.join("&")}` : "";
+    const data = await this.requestJson<unknown>(
+      `/api/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/events${qs}`
+    );
+    return Array.isArray(data) ? (data as RawRunEvent[]) : [];
+  }
+
+  /** Plan-mode checklist from the thread state (`values.todos`). */
+  async getTodos(threadId: string): Promise<TodoItem[]> {
+    const state = await this.getThreadState(threadId);
+    const todos = state.values?.todos;
+    if (!Array.isArray(todos)) return [];
+    return todos.filter(isRecord).map((t) => ({
+      content: typeof t.content === "string" ? t.content : String(t.content ?? ""),
+      status: typeof t.status === "string" ? t.status : "pending",
+    }));
+  }
+
+  /**
+   * Compose a live progress snapshot for a run from three sources: the run row
+   * (status + live counters + timestamps), the run event stream (recent
+   * activity), and the thread state (plan-mode todos).
+   *
+   * Pass `sinceSeq` for delta mode: only events with `seq > sinceSeq` are
+   * included in `activity` (and `last_event_seq` never goes below `sinceSeq`).
+   */
+  async getProgress(
+    threadId: string,
+    runId: string,
+    opts: { sinceSeq?: number; activityLimit?: number; now?: number } = {}
+  ): Promise<RunProgress> {
+    const nowMs = opts.now ?? Date.now();
+    const activityLimit = opts.activityLimit ?? 10;
+    const sinceSeq = opts.sinceSeq;
+    const [run, events, todos] = await Promise.all([
+      this.getRun(threadId, runId),
+      sinceSeq !== undefined && sinceSeq > 0
+        ? this.listRunEvents(threadId, runId, { limit: activityLimit, afterSeq: sinceSeq })
+        : this.latestRunEvents(threadId, runId, activityLimit),
+      this.getTodos(threadId),
+    ]);
+    return composeProgress(run, events, todos, {
+      baseUrl: this.config.webBaseUrl,
+      stallThresholdSeconds: this.config.stallThresholdSeconds,
+      nowMs,
+    });
+  }
+
+  /**
+   * The latest `count` events of a run. The events endpoint paginates forward
+   * only (after_seq), so a bare `limit` returns the FIRST events; fetch a
+   * bounded window from the start and slice the tail. Refetches with a wider
+   * window when the first one was full (the run has more events than the
+   * window).
+   */
+  private async latestRunEvents(
+    threadId: string,
+    runId: string,
+    count: number
+  ): Promise<RawRunEvent[]> {
+    const WINDOW = 500;
+    let events = await this.listRunEvents(threadId, runId, { limit: WINDOW });
+    if (events.length === WINDOW) {
+      events = await this.listRunEvents(threadId, runId, { limit: 2000 });
+    }
+    return events.slice(-count);
+  }
+
+  /**
+   * Server-side long-poll: wait until the run produces new activity (an event
+   * with `seq > sinceSeq`), reaches a terminal status, or `timeoutSeconds`
+   * elapses. Polls every `pollIntervalMs` so a single MCP call replaces many
+   * status checks. Returns the full progress snapshot plus `reason` and
+   * `waited_seconds`.
+   */
+  async waitForActivity(
+    threadId: string,
+    runId: string,
+    opts: { sinceSeq?: number; timeoutSeconds?: number } = {}
+  ): Promise<RunActivityWaitResult> {
+    const timeoutSeconds = Math.max(
+      1,
+      Math.min(opts.timeoutSeconds ?? 30, this.config.progressWaitMaxSeconds)
+    );
+    const timeoutMs = timeoutSeconds * 1000;
+    const startedAt = Date.now();
+    let sinceSeq = opts.sinceSeq ?? 0;
+
+    const build = (progress: RunProgress, reason: ActivityWaitReason): RunActivityWaitResult => ({
+      ...progress,
+      reason,
+      waited_seconds: Math.max(0, Math.round((Date.now() - startedAt) / 1000)),
+    });
+
+    // Initial check (full snapshot, todos included).
+    const progress = await this.getProgress(threadId, runId, { sinceSeq });
+    if (progress.terminal) return build(progress, "terminal");
+    if (progress.activity.length > 0) {
+      sinceSeq = progress.last_event_seq ?? sinceSeq;
+      return build(progress, "activity");
+    }
+
+    const deadline = startedAt + timeoutMs;
+    while (Date.now() < deadline) {
+      const remaining = deadline - Date.now();
+      const sleep = Math.max(0, Math.min(this.pollIntervalMs, remaining));
+      if (sleep > 0) await new Promise((resolve) => setTimeout(resolve, sleep));
+      if (Date.now() >= deadline) break;
+      const [run, events] = await Promise.all([
+        this.getRun(threadId, runId),
+        this.listRunEvents(threadId, runId, { limit: 20, afterSeq: sinceSeq }),
+      ]);
+      if (isTerminalRunStatus(run.status)) {
+        return build(await this.getProgress(threadId, runId, { sinceSeq }), "terminal");
+      }
+      if (events.length > 0) {
+        sinceSeq = Math.max(sinceSeq, ...events.map((e) => e.seq ?? 0));
+        return build(await this.getProgress(threadId, runId, { sinceSeq }), "activity");
+      }
+    }
+    return build(await this.getProgress(threadId, runId, { sinceSeq }), "timeout");
+  }
+
   // --- Models & artifacts ------------------------------------------------
 
   async listModels(): Promise<ModelInfo[]> {
@@ -634,6 +778,25 @@ interface RawRunResponse {
   stop_reason?: string | null;
   created_at?: string;
   updated_at?: string;
+  total_tokens?: number;
+  llm_call_count?: number;
+  message_count?: number;
+  error?: string | null;
+}
+
+/**
+ * A persisted run event from `GET /api/threads/{id}/runs/{run_id}/events`.
+ * `content` is a serialized LangChain message for `llm.*` events, a string for
+ * `run.error`/`llm.error`, and an object otherwise.
+ */
+export interface RawRunEvent {
+  seq?: number;
+  event_type?: string;
+  category?: string;
+  content?: unknown;
+  metadata?: Record<string, unknown> | null;
+  created_at?: string;
+  run_id?: string;
 }
 
 interface ThreadState {
@@ -642,6 +805,7 @@ interface ThreadState {
     summary_text?: string | null;
     artifacts?: unknown[];
     messages?: unknown[];
+    todos?: unknown[];
   };
 }
 
@@ -658,6 +822,10 @@ function normalizeRun(raw: RawRunResponse | undefined, threadId: string): RunInf
     stop_reason: raw.stop_reason ?? undefined,
     created_at: raw.created_at,
     updated_at: raw.updated_at,
+    ...(raw.total_tokens !== undefined ? { total_tokens: raw.total_tokens } : {}),
+    ...(raw.llm_call_count !== undefined ? { llm_call_count: raw.llm_call_count } : {}),
+    ...(raw.message_count !== undefined ? { message_count: raw.message_count } : {}),
+    ...(raw.error ? { error: raw.error } : {}),
   };
 }
 
@@ -678,6 +846,207 @@ function normalizeThreadSummary(raw: unknown): ThreadSummary {
 function isMessageObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
+
+// --- Progress composition & event summarization --------------------------
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function oneLine(value: string, max: number): string {
+  const flattened = value.replace(/\s+/g, " ").trim();
+  return flattened.length > max ? `${flattened.slice(0, max)}…` : flattened;
+}
+
+/** Tool-call argument keys whose string value reads as "the" argument. */
+const PREFERRED_ARG_KEYS = [
+  "query",
+  "prompt",
+  "message",
+  "content",
+  "text",
+  "topic",
+  "url",
+  "path",
+  "file_path",
+  "pattern",
+  "title",
+];
+
+/** Reduce a tool-call argument to a short human-readable string. */
+function summarizeArgValue(arg: unknown): string {
+  if (arg === undefined || arg === null) return "";
+  if (typeof arg === "string") return arg;
+  if (typeof arg === "number" || typeof arg === "boolean") return String(arg);
+  const obj = asRecord(arg);
+  if (obj) {
+    for (const key of PREFERRED_ARG_KEYS) {
+      const value = obj[key];
+      if (typeof value === "string" && value.length > 0) return value;
+    }
+  }
+  return JSON.stringify(arg);
+}
+
+function parseIsoMs(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const ms = Date.parse(value);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/**
+ * Reduce one raw run event to a compact one-line summary. Exported for tests.
+ */
+export function summarizeRunEvent(evt: RawRunEvent): RunEventSummary {
+  const type = evt.event_type ?? "unknown";
+  const base = { seq: evt.seq ?? 0, ...(evt.created_at ? { at: evt.created_at } : {}) };
+  switch (type) {
+    case "llm.ai.response": {
+      const msg = asRecord(evt.content);
+      const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
+      if (toolCalls.length > 0) {
+        const names = toolCalls.slice(0, 3).map((tc) => {
+          const t = asRecord(tc);
+          const name = typeof t?.name === "string" ? t.name : "tool";
+          const argText = summarizeArgValue(t?.args);
+          return argText ? `${name}(${oneLine(argText, 80)})` : name;
+        });
+        const more = toolCalls.length > 3 ? ` +${toolCalls.length - 3} more` : "";
+        return { ...base, kind: "ai", summary: `tool_calls: ${names.join("; ")}${more}` };
+      }
+      const text = oneLine(messageText(msg ?? {}), 160);
+      return { ...base, kind: "ai", summary: text || "(empty ai message)" };
+    }
+    case "llm.tool.result": {
+      const msg = asRecord(evt.content);
+      const name = typeof msg?.name === "string" ? msg.name : "tool";
+      const text = oneLine(
+        typeof msg?.content === "string" ? msg.content : messageText(msg ?? {}),
+        100
+      );
+      return {
+        ...base,
+        kind: "tool",
+        summary: text ? `${name} → ${text}` : `${name} → (no content)`,
+      };
+    }
+    case "run.error":
+    case "llm.error": {
+      const text =
+        typeof evt.content === "string" ? evt.content : JSON.stringify(evt.content ?? "");
+      return { ...base, kind: "error", summary: `error: ${oneLine(text, 160)}` };
+    }
+    default:
+      return { ...base, kind: "other", summary: type };
+  }
+}
+
+/**
+ * Compose a {@link RunProgress} snapshot from a run row, its recent events,
+ * and the thread's plan-mode todos. Pure so it can be unit-tested without
+ * network access.
+ */
+export function composeProgress(
+  run: RunInfo,
+  events: RawRunActivityLike[],
+  todos: TodoItem[],
+  opts: { baseUrl: string; stallThresholdSeconds: number; nowMs: number }
+): RunProgress {
+  const terminal = isTerminalRunStatus(run.status);
+
+  const activity = events.map(summarizeRunEvent);
+  const eventSeqs = events.map((e) => e.seq ?? 0);
+  const lastEventSeq = eventSeqs.length > 0 ? Math.max(...eventSeqs) : undefined;
+
+  // Last activity signal: newest of run timestamps and event timestamps.
+  const candidates: number[] = [];
+  const createdMs = parseIsoMs(run.created_at);
+  const updatedMs = parseIsoMs(run.updated_at);
+  if (createdMs !== undefined) candidates.push(createdMs);
+  if (updatedMs !== undefined) candidates.push(updatedMs);
+  for (const e of events) {
+    const ms = parseIsoMs(e.created_at);
+    if (ms !== undefined) candidates.push(ms);
+  }
+  const lastActivityMs = candidates.length > 0 ? Math.max(...candidates) : undefined;
+
+  const elapsedSeconds =
+    createdMs !== undefined ? Math.max(0, Math.round((opts.nowMs - createdMs) / 1000)) : 0;
+  const secondsSinceUpdate =
+    updatedMs !== undefined ? Math.max(0, Math.round((opts.nowMs - updatedMs) / 1000)) : undefined;
+  const secondsSinceActivity =
+    lastActivityMs !== undefined
+      ? Math.max(0, Math.round((opts.nowMs - lastActivityMs) / 1000))
+      : undefined;
+
+  const stalled =
+    !terminal &&
+    secondsSinceActivity !== undefined &&
+    secondsSinceActivity > opts.stallThresholdSeconds;
+
+  let lastActivityAt: string | undefined;
+  if (lastActivityMs !== undefined) {
+    // Prefer the timestamp of the signal that produced the max value.
+    const eventMax = events.reduce<number | undefined>((max, e) => {
+      const ms = parseIsoMs(e.created_at);
+      return ms !== undefined && (max === undefined || ms > max) ? ms : max;
+    }, undefined);
+    lastActivityAt =
+      eventMax !== undefined && eventMax === lastActivityMs
+        ? events.find((e) => parseIsoMs(e.created_at) === eventMax)?.created_at
+        : updatedMs === lastActivityMs
+          ? run.updated_at
+          : run.created_at;
+  }
+
+  let error = run.error;
+  if (!error) {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e && (e.event_type === "run.error" || e.event_type === "llm.error")) {
+        error = typeof e.content === "string" ? e.content : JSON.stringify(e.content ?? "");
+        break;
+      }
+    }
+  }
+
+  return {
+    run_id: run.run_id,
+    thread_id: run.thread_id,
+    status: run.status,
+    stop_reason: run.stop_reason ?? null,
+    terminal,
+    created_at: run.created_at,
+    updated_at: run.updated_at,
+    elapsed_seconds: elapsedSeconds,
+    ...(secondsSinceUpdate !== undefined ? { seconds_since_update: secondsSinceUpdate } : {}),
+    ...(run.total_tokens !== undefined ? { total_tokens: run.total_tokens } : {}),
+    ...(run.llm_call_count !== undefined ? { llm_call_count: run.llm_call_count } : {}),
+    ...(run.message_count !== undefined ? { message_count: run.message_count } : {}),
+    ...(lastEventSeq !== undefined ? { last_event_seq: lastEventSeq } : {}),
+    ...(lastActivityAt !== undefined ? { last_activity_at: lastActivityAt } : {}),
+    ...(secondsSinceActivity !== undefined ? { seconds_since_activity: secondsSinceActivity } : {}),
+    stalled,
+    ...(stalled
+      ? {
+          hint: `No activity for ${secondsSinceActivity}s while status is still "${run.status}". The run may be stuck on a long tool call or on a dead worker — open ${opts.baseUrl}/workspace/chats/${run.thread_id} to check, or stop it with deerflow_cancel_run.`,
+        }
+      : {}),
+    ...(error ? { error: truncate(error, 500) } : {}),
+    activity,
+    todos,
+  };
+}
+
+/** The event fields `composeProgress` needs (a structural subset of RawRunEvent). */
+type RawRunActivityLike = Pick<RawRunEvent, "seq" | "event_type" | "content" | "created_at"> &
+  Partial<RawRunEvent>;
 
 /** Extract display text from a LangGraph message (string or content blocks). */
 function messageText(msg: Record<string, unknown>): string {

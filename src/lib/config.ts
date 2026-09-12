@@ -12,10 +12,14 @@ export const ENV = {
   defaultRecursionLimit: "DEERFLOW_DEFAULT_RECURSION_LIMIT",
   timeoutMs: "DEERFLOW_TIMEOUT_MS",
   webBaseUrl: "DEERFLOW_WEB_BASE_URL",
+  stallThresholdSeconds: "DEERFLOW_STALL_THRESHOLD_SECONDS",
+  progressWaitMaxSeconds: "DEERFLOW_PROGRESS_WAIT_MAX_SECONDS",
 } as const;
 
 const DEFAULT_RECURSION_LIMIT = 1000;
 const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_STALL_THRESHOLD_SECONDS = 180;
+const DEFAULT_PROGRESS_WAIT_MAX_SECONDS = 120;
 
 export type Env = Record<string, string | undefined>;
 
@@ -119,6 +123,16 @@ export function loadConfig(env: Env = process.env): DeerFlowConfig {
     DEFAULT_TIMEOUT_MS,
     ENV.timeoutMs
   );
+  const stallThresholdSeconds = parsePositiveInt(
+    readTrimmed(env, ENV.stallThresholdSeconds),
+    DEFAULT_STALL_THRESHOLD_SECONDS,
+    ENV.stallThresholdSeconds
+  );
+  const progressWaitMaxSeconds = parsePositiveInt(
+    readTrimmed(env, ENV.progressWaitMaxSeconds),
+    DEFAULT_PROGRESS_WAIT_MAX_SECONDS,
+    ENV.progressWaitMaxSeconds
+  );
 
   return {
     baseUrl,
@@ -127,5 +141,7 @@ export function loadConfig(env: Env = process.env): DeerFlowConfig {
     ...(defaultModel ? { defaultModel } : {}),
     defaultRecursionLimit,
     timeoutMs,
+    stallThresholdSeconds,
+    progressWaitMaxSeconds,
   };
 }

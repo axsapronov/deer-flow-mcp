@@ -14,7 +14,9 @@ const ALL_TOOLS = [
   "deerflow_list_models",
   "deerflow_list_threads",
   "deerflow_research",
+  "deerflow_run_progress",
   "deerflow_run_status",
+  "deerflow_wait_activity",
 ].sort();
 
 /**
@@ -50,7 +52,7 @@ function textOf(result: { content: unknown[] }): string {
 }
 
 describe("MCP tools", () => {
-  it("registers exactly the nine expected tools", async () => {
+  it("registers exactly the eleven expected tools", async () => {
     await withTools(
       () => ({ body: {} }),
       async (client) => {
@@ -106,9 +108,20 @@ describe("MCP tools", () => {
     );
   });
 
-  it("deerflow_run_status returns status with a terminal flag", async () => {
+  it("deerflow_run_status returns status, a terminal flag, and live counters", async () => {
     await withTools(
-      () => ({ body: { run_id: "r-1", status: "success", stop_reason: null } }),
+      () => ({
+        body: {
+          run_id: "r-1",
+          status: "success",
+          stop_reason: null,
+          created_at: "2026-09-12T03:53:51.000Z",
+          updated_at: "2026-09-12T04:00:00.000Z",
+          llm_call_count: 20,
+          message_count: 52,
+          total_tokens: 1000,
+        },
+      }),
       async (client) => {
         const res = await client.callTool({
           name: "deerflow_run_status",
@@ -117,6 +130,109 @@ describe("MCP tools", () => {
         const text = textOf(res);
         expect(text).toContain('"status": "success"');
         expect(text).toContain('"terminal": true');
+        expect(text).toContain('"llm_call_count": 20');
+        expect(text).toContain('"message_count": 52');
+        expect(text).toContain('"total_tokens": 1000');
+        expect(text).toContain('"elapsed_seconds"');
+      }
+    );
+  });
+
+  it("deerflow_run_progress returns activity, todos, and stall detection", async () => {
+    const now = Date.now();
+    const recent = new Date(now - 10_000).toISOString();
+    const started = new Date(now - 40 * 60_000).toISOString();
+    await withTools(
+      (call) => {
+        if (call.url.includes("/runs/r-1/events"))
+          return {
+            body: [
+              {
+                seq: 9,
+                event_type: "llm.ai.response",
+                created_at: recent,
+                content: {
+                  type: "ai",
+                  content: "",
+                  tool_calls: [{ name: "web_search", args: { query: "vLLM v0.25.0" } }],
+                },
+              },
+              {
+                seq: 10,
+                event_type: "llm.tool.result",
+                created_at: recent,
+                content: { type: "tool", name: "web_search", content: "10 results found" },
+              },
+            ],
+          };
+        if (call.url.endsWith("/state"))
+          return {
+            body: {
+              values: {
+                todos: [
+                  { content: "Gather history", status: "in_progress" },
+                  { content: "Write report", status: "pending" },
+                ],
+              },
+            },
+          };
+        return {
+          body: {
+            run_id: "r-1",
+            status: "running",
+            created_at: started,
+            updated_at: recent,
+            llm_call_count: 20,
+          },
+        };
+      },
+      async (client) => {
+        const res = await client.callTool({
+          name: "deerflow_run_progress",
+          arguments: { thread_id: "t-1", run_id: "r-1" },
+        });
+        expect(res.isError).toBeFalsy();
+        const text = textOf(res);
+        expect(text).toContain('"status": "running"');
+        expect(text).toContain('"stalled": false');
+        expect(text).toContain("web_search(vLLM v0.25.0)");
+        expect(text).toContain("web_search → 10 results found");
+        expect(text).toContain('"Gather history"');
+        expect(text).toContain('"last_event_seq": 10');
+      }
+    );
+  });
+
+  it("deerflow_wait_activity returns new activity with reason 'activity'", async () => {
+    const now = Date.now();
+    const recent = new Date(now - 1_000).toISOString();
+    const started = new Date(now - 40 * 60_000).toISOString();
+    await withTools(
+      (call) => {
+        if (call.url.includes("/runs/r-1/events"))
+          return {
+            body: [
+              {
+                seq: 11,
+                event_type: "llm.tool.result",
+                created_at: recent,
+                content: { type: "tool", name: "web_search", content: "done" },
+              },
+            ],
+          };
+        if (call.url.endsWith("/state")) return { body: { values: { todos: [] } } };
+        return { body: { run_id: "r-1", status: "running", created_at: started } };
+      },
+      async (client) => {
+        const res = await client.callTool({
+          name: "deerflow_wait_activity",
+          arguments: { thread_id: "t-1", run_id: "r-1", since_seq: 10, timeout_seconds: 5 },
+        });
+        expect(res.isError).toBeFalsy();
+        const text = textOf(res);
+        expect(text).toContain('"reason": "activity"');
+        expect(text).toContain('"last_event_seq": 11');
+        expect(text).toContain("web_search → done");
       }
     );
   });

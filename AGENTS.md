@@ -59,9 +59,9 @@ src/
 test/             # Vitest tests (mirror the src/ layout)
 ```
 
-> Status: the core `src/lib/*` modules are implemented. The server entry point
-> (`src/index.ts`) and the MCP tool registrations are the primary remaining surface —
-> they wire the CLI, choose the transport, and register the DeerFlow tools on the `McpServer`.
+> Status: the server is implemented end to end. The entry point (`src/index.ts`) wires the
+> CLI and transport; `src/lib/tools.ts` registers the DeerFlow tools (research, chat,
+> run status/progress/wait-activity, report, threads, artifacts, models) on the `McpServer`.
 
 ## Configuration
 
@@ -75,7 +75,10 @@ MCP client gets a clean error instead of a cryptic first-request failure.
 - `DEERFLOW_INTERNAL_TOKEN` — gateway internal token; full access (models + artifact files)
 - `DEERFLOW_OWNER_USER_ID` — used only with internal-token mode
 - Optional defaults: `DEERFLOW_DEFAULT_MODEL`, `DEERFLOW_DEFAULT_RECURSION_LIMIT` (default 1000),
-  `DEERFLOW_TIMEOUT_MS` (default 60000), `DEERFLOW_WEB_BASE_URL`
+  `DEERFLOW_TIMEOUT_MS` (default 60000), `DEERFLOW_WEB_BASE_URL`,
+  `DEERFLOW_STALL_THRESHOLD_SECONDS` (default 180 — seconds without activity before a running run is
+  reported as stalled), `DEERFLOW_PROGRESS_WAIT_MAX_SECONDS` (default 120 — cap for the
+  `deerflow_wait_activity` timeout)
 
 Auth is a discriminated union (`DeerFlowAuth`): either `pat` or `internal`. PAT callers
 cannot reach `/api/models` or individual artifact files (they 403); use internal-token
